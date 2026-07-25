@@ -8,6 +8,7 @@ members = [
     "crates/aether-connector",
     "crates/aether-api",
     "crates/aether-gateway",
+    "tests/aether-integration",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ aether-routing = { path = "crates/aether-routing" }
 aether-cluster = { path = "crates/aether-cluster" }
 aether-connector = { path = "crates/aether-connector" }
 aether-api = { path = "crates/aether-api" }
+aether-integration = { path = "tests/aether-integration" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
