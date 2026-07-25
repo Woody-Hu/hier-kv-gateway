@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aether-core",
+    "crates/aether-metadata",
+    "crates/aether-routing",
+    "crates/aether-cluster",
+    "crates/aether-connector",
+    "crates/aether-api",
+    "crates/aether-gateway",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+aether-core = { path = "crates/aether-core" }
+aether-metadata = { path = "crates/aether-metadata" }
+aether-routing = { path = "crates/aether-routing" }
+aether-cluster = { path = "crates/aether-cluster" }
+aether-connector = { path = "crates/aether-connector" }
+aether-api = { path = "crates/aether-api" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+axum = "0.8"
+dashmap = "6"
+arc-swap = "1"
+thiserror = "2"
+anyhow = "1"
+bytes = "1"
+futures = "0.3"
+rand = "0.9"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
