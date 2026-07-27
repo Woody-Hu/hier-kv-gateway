@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.18.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hier-kv-gateway"
+version = "0.1.0"
+description = "Python SDK / glue layer for the Hier KV Gateway, an OpenAI-compatible LLM gateway."
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Hier KV Gateway Contributors" },
+]
+keywords = ["llm", "gateway", "openai", "kv-cache", "routing", "inference"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "requests>=2.28",
+    "aiohttp>=3.9",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/hudi/hier-kv-gateway"
+Repository = "https://github.com/hudi/hier-kv-gateway"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hier_kv_gateway"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "hier_kv_gateway",
+    "examples",
+]

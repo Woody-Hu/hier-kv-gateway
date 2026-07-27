@@ -1,19 +1,19 @@
-# Hier KV Gateway 接口与数据模型设计
+# Hier KV Gateway Interface and Data Model Design
 
-> 中文 | [English](en/03-interfaces-data-models.md)
+> English | [中文](../03-interfaces-data-models.md)
 
-> 详细的 Rust 数据结构、Trait 接口、对内对外 API 设计
+> Detailed Rust data structures, trait interfaces, and internal/external API design
 
-## 1. 核心标识类型
+## 1. Core Identifier Types
 
 ```rust
 // crates/hier-kv-gateway-core/src/ids.rs
 
-/// 区域标识，稳定字符串，跨重启不变
+/// Region identifier; a stable string that survives restarts
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct RegionId(pub Arc<str>);
 
-/// 区域层级
+/// Region tier
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RegionTier {
     Cloud,
@@ -21,41 +21,41 @@ pub enum RegionTier {
     Device,
 }
 
-/// 后端实例标识
+/// Backend instance identifier
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendId {
     pub region: RegionId,
     pub instance: BackendInstanceId,
 }
 
-/// 后端实例标识（region 内唯一）
+/// Backend instance identifier (unique within a region)
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendInstanceId(pub Arc<str>);
 
-/// 索引域标识（模型兼容性分组）
+/// Indexer domain identifier (model compatibility group)
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IndexerDomainId(pub u64);
 
-/// 池标识 = (IndexerDomainId, RegionId)
+/// Pool identifier = (IndexerDomainId, RegionId)
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PoolId {
     pub domain: IndexerDomainId,
     pub region: RegionId,
 }
 
-/// Gateway 实例标识
+/// Gateway instance identifier
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstanceId(pub Arc<str>);
 
-/// 请求 ID
+/// Request ID
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RequestId(pub Arc<str>);
 
-/// 会话 ID（用于会话亲和）
+/// Session ID (used for session affinity)
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionId(pub Arc<str>);
 
-/// Worker + DP Rank（集群后端内部并行维度）
+/// Worker + DP Rank (an internal parallelism dimension of cluster backends)
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkerWithRank {
     pub worker_id: u64,
@@ -63,14 +63,14 @@ pub struct WorkerWithRank {
 }
 ```
 
-## 2. 元数据模型
+## 2. Metadata Model
 
-### 2.1 后端信息
+### 2.1 Backend Information
 
 ```rust
 // crates/hier-kv-gateway-core/src/backend.rs
 
-/// 后端完整描述
+/// Full backend description
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackendInfo {
     pub id: BackendId,
@@ -84,7 +84,7 @@ pub struct BackendInfo {
     pub status: BackendStatus,
 }
 
-/// 后端类型
+/// Backend type
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BackendType {
     LlmDCluster,
@@ -93,7 +93,7 @@ pub enum BackendType {
     GenericOpenAI,
 }
 
-/// 网络端点
+/// Network endpoint
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Endpoint {
     pub url: String,
@@ -107,7 +107,7 @@ pub enum Protocol {
     Nats,
 }
 
-/// 模型实例信息
+/// Model instance information
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelInstance {
     pub model_name: String,
@@ -128,7 +128,7 @@ pub enum Quantization {
     Gptq,
 }
 
-/// 后端能力
+/// Backend capabilities
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BackendCapabilities {
     pub supports_kv_events: bool,
@@ -139,15 +139,15 @@ pub struct BackendCapabilities {
     pub gpu_memory_gb: f64,
 }
 
-/// KV 配置
+/// KV configuration
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvConfig {
-    pub block_size: u32,           // KV block token 数
-    pub cache_namespace: String,   // 缓存命名空间
+    pub block_size: u32,           // number of tokens per KV block
+    pub cache_namespace: String,   // cache namespace
     pub max_kv_blocks: u64,
 }
 
-/// 后端运行状态
+/// Backend running status
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BackendStatus {
     Healthy,
@@ -157,12 +157,12 @@ pub enum BackendStatus {
 }
 ```
 
-### 2.2 负载指标
+### 2.2 Load Metrics
 
 ```rust
 // crates/hier-kv-gateway-core/src/metrics.rs
 
-/// 后端实时负载指标
+/// Real-time backend load metrics
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BackendMetrics {
     pub active_requests: u32,
@@ -178,7 +178,7 @@ pub struct BackendMetrics {
     pub timestamp: u64,              // unix millis
 }
 
-/// 延迟统计（滑动窗口）
+/// Latency statistics (sliding window)
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LatencyStats {
     pub p50_ms: f64,
@@ -187,7 +187,7 @@ pub struct LatencyStats {
     pub sample_count: u32,
 }
 
-/// 派生指标（路由用）
+/// Derived metrics (for routing)
 impl BackendMetrics {
     pub fn kv_cache_usage(&self) -> f64 {
         if self.kv_total_blocks == 0 { return 0.0; }
@@ -200,7 +200,7 @@ impl BackendMetrics {
     }
     
     pub fn available_capacity(&self) -> i64 {
-        // 估算剩余可接受请求数
+        // Estimate the remaining number of acceptable requests
         let kv_avail = (self.kv_total_blocks - self.kv_used_blocks) as i64;
         let gpu_room = ((1.0 - self.gpu_utilization) * 100.0) as i64;
         kv_avail.min(gpu_room)
@@ -208,12 +208,12 @@ impl BackendMetrics {
 }
 ```
 
-### 2.3 KV Cache 事件
+### 2.3 KV Cache Events
 
 ```rust
 // crates/hier-kv-gateway-core/src/kv_event.rs
 
-/// KV Cache 事件
+/// KV Cache event
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KvCacheEvent {
@@ -230,14 +230,14 @@ pub enum KvCacheEvent {
     Clear {
         worker: WorkerWithRank,
     },
-    /// Worker 重置（generation fence）
+    /// Worker reset (generation fence)
     Reset {
         worker: WorkerWithRank,
         generation: u64,
     },
 }
 
-/// Block hash 计算输入
+/// Block hash computation input
 #[derive(Clone, Debug)]
 pub struct BlockHashInput<'a> {
     pub token_ids: &'a [u32],
@@ -246,9 +246,9 @@ pub struct BlockHashInput<'a> {
     pub cache_namespace: Option<&'a str>,
 }
 
-/// 计算 block hashes
+/// Compute block hashes
 pub fn compute_block_hashes(input: &BlockHashInput) -> Vec<u64> {
-    // 按 compute_block_hash_for_seq 思路实现
+    // Implemented following the compute_block_hash_for_seq approach
     let mut hashes = Vec::new();
     for chunk in input.token_ids.chunks(input.block_size as usize) {
         let mut h = xxhash_rust::xxh3_64(chunk);
@@ -267,19 +267,19 @@ pub fn compute_block_hashes(input: &BlockHashInput) -> Vec<u64> {
 }
 ```
 
-### 2.4 拓扑信息
+### 2.4 Topology Information
 
 ```rust
 // crates/hier-kv-gateway-core/src/topology.rs
 
-/// 区域信息
+/// Region information
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegionInfo {
     pub id: RegionId,
     pub tier: RegionTier,
     pub geo: Option<GeoCoord>,
     pub network_zone: Option<String>,
-    pub endpoints: Vec<String>,  // 该 region 的 gateway 地址
+    pub endpoints: Vec<String>,  // gateway addresses for this region
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -288,7 +288,7 @@ pub struct GeoCoord {
     pub lon: f64,
 }
 
-/// 两区域间延迟估计
+/// Latency estimate between two regions
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct LatencyEstimate {
     pub rtt_p50_ms: f64,
@@ -297,39 +297,39 @@ pub struct LatencyEstimate {
     pub last_updated_unix: u64,
 }
 
-/// 延迟矩阵
+/// Latency matrix
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LatencyMatrix {
     pub entries: HashMap<(RegionId, RegionId), LatencyEstimate>,
 }
 
 impl LatencyMatrix {
-    /// 获取两区域间延迟，无数据时用地理距离估算
+    /// Get the latency between two regions; fall back to geographic-distance estimation when no data
     pub fn rtt_ms(&self, a: &RegionId, b: &RegionId, regions: &HashMap<RegionId, RegionInfo>) -> f64 {
         if a == b { return 0.0; }
         if let Some(est) = self.entries.get(&(a.clone(), b.clone())) {
             return est.rtt_p50_ms;
         }
-        // 地理距离估算
+        // Geographic-distance estimation
         if let (Some(ra), Some(rb)) = (regions.get(a), regions.get(b)) {
             if let (Some(ga), Some(gb)) = (ra.geo, rb.geo) {
                 let dist_km = haversine_km(ga, gb);
-                return dist_km / 200.0; // 光纤 ~200km/ms
+                return dist_km / 200.0; // fiber ~200km/ms
             }
         }
-        100.0 // 默认 100ms
+        100.0 // default 100ms
     }
 }
 ```
 
-## 3. Trait 接口设计
+## 3. Trait Interface Design
 
-### 3.1 路由策略接口
+### 3.1 Routing Strategy Interface
 
 ```rust
 // crates/hier-kv-gateway-routing/src/strategy.rs
 
-/// 路由上下文（每次请求构建）
+/// Routing context (built per request)
 #[derive(Clone, Debug)]
 pub struct RoutingContext {
     pub request_id: RequestId,
@@ -344,16 +344,16 @@ pub struct RoutingContext {
     pub requires_tool_calling: bool,
 }
 
-/// 带分数的后端
+/// A backend with a score
 #[derive(Clone, Debug)]
 pub struct ScoredBackend {
     pub backend_id: BackendId,
-    pub score: f64,        // [0, 1], 1.0 = 最优
-    pub raw_cost: f64,    // 策略原始成本
+    pub score: f64,        // [0, 1], 1.0 = optimal
+    pub raw_cost: f64,    // strategy raw cost
     pub meta_version: u64,
 }
 
-/// 路由策略 trait
+/// Routing strategy trait
 #[async_trait]
 pub trait RoutingStrategy: Send + Sync {
     fn name(&self) -> &'static str;
@@ -367,17 +367,17 @@ pub trait RoutingStrategy: Send + Sync {
     
     fn is_available(&self, meta: &MetadataStore) -> bool;
     
-    /// 策略权重（Hybrid 用）
+    /// Strategy weight (used by Hybrid)
     fn weight(&self) -> f64;
 }
 ```
 
-### 3.2 元数据存储接口
+### 3.2 Metadata Store Interface
 
 ```rust
 // crates/hier-kv-gateway-metadata/src/store.rs
 
-/// 元数据存储（所有路由策略的统一数据源）
+/// Metadata store (the unified data source for all routing strategies)
 pub struct MetadataStore {
     kv_index: KvIndex,
     ckf_consumer: CkfConsumer,
@@ -388,23 +388,23 @@ pub struct MetadataStore {
 }
 
 impl MetadataStore {
-    // === KV 相关 ===
+    // === KV related ===
     pub fn kv_find_local_overlap(&self, hashes: &[u64], backend: &BackendId) -> u32;
     pub fn kv_find_global_overlap(&self, hashes: &[u64], region: &RegionId) -> u32;
     pub fn kv_apply_event(&self, event: KvCacheEvent, backend: &BackendId);
-    pub fn kv_confidence(&self) -> f64;  // CKF 置信度
+    pub fn kv_confidence(&self) -> f64;  // CKF confidence
     
-    // === Model 相关 ===
+    // === Model related ===
     pub fn model_match_score(&self, backend: &BackendId, model: &str) -> f64;
     pub fn model_get_instances(&self, backend: &BackendId) -> &[ModelInstance];
     pub fn model_find_backends(&self, model: &str) -> Vec<BackendId>;
     
-    // === Load 相关 ===
+    // === Load related ===
     pub fn load_get_metrics(&self, backend: &BackendId) -> Option<BackendMetrics>;
     pub fn load_update(&self, backend: &BackendId, metrics: BackendMetrics);
     pub fn load_freshness(&self, backend: &BackendId) -> Option<Duration>;
     
-    // === Topology 相关 ===
+    // === Topology related ===
     pub fn topo_rtt_ms(&self, from: &RegionId, to: &RegionId) -> f64;
     pub fn topo_get_region(&self, region: &RegionId) -> Option<&RegionInfo>;
     
@@ -418,7 +418,7 @@ impl MetadataStore {
     pub fn backends_by_domain(&self, domain: &IndexerDomainId) -> Vec<&BackendInfo>;
 }
 
-/// 会话亲和记录
+/// Session affinity record
 #[derive(Clone, Debug)]
 pub struct SessionAffinity {
     pub backend: BackendId,
@@ -427,7 +427,7 @@ pub struct SessionAffinity {
 }
 ```
 
-### 3.3 后端连接器接口
+### 3.3 Backend Connector Interface
 
 ```rust
 // crates/hier-kv-gateway-connector/src/connector.rs
@@ -463,7 +463,7 @@ pub struct HealthStatus {
     pub error_count: u32,
 }
 
-/// 推理请求（内部表示）
+/// Inference request (internal representation)
 #[derive(Clone, Debug)]
 pub struct InferenceRequest {
     pub request_id: RequestId,
@@ -477,48 +477,48 @@ pub struct InferenceRequest {
     pub lora_name: Option<String>,
 }
 
-/// 推理响应块（流式）
+/// Inference response chunk (streaming)
 #[derive(Clone, Debug)]
 pub enum InferenceChunk {
-    /// 文本块
+    /// Text chunk
     Delta { text: String, finish_reason: Option<String> },
-    /// 工具调用块
+    /// Tool-call chunk
     ToolCall { id: String, function: String, args: String },
-    /// 请求完成
+    /// Request complete
     Done { backend_id: BackendId, latency: Duration },
-    /// 错误
+    /// Error
     Error { code: u16, message: String },
 }
 ```
 
-### 3.4 集群通信接口
+### 3.4 Cluster Communication Interface
 
 ```rust
 // crates/hier-kv-gateway-cluster/src/transport.rs
 
-/// 集群消息
+/// Cluster message
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClusterMessage {
-    /// Gossip 心跳
+    /// Gossip heartbeat
     Ping { sender: InstanceId, meta_digest: MetaDigest },
     Pong { sender: InstanceId, meta_digest: MetaDigest },
-    /// 新成员加入
+    /// New member joining
     Meet { sender: InstanceId, region: RegionId, addr: String },
-    /// 状态同步请求
+    /// State sync request
     SyncRequest { sender: InstanceId, keys: Vec<MetaKey> },
     SyncResponse { entries: Vec<MetaEntry> },
-    /// CKF 发布
+    /// CKF publication
     CkfBarrierSnapshot { pool: PoolId, sequence: u64, buckets: Vec<PackedBucket> },
     CkfDelta { pool: PoolId, sequence: u64, dirty_buckets: Vec<PackedBucket> },
-    /// 负载指标广播
+    /// Load metric broadcast
     MetricsBroadcast { region: RegionId, backends: Vec<(BackendId, BackendMetrics)> },
-    /// 拓扑更新
+    /// Topology update
     TopologyUpdate { matrix: LatencyMatrix },
-    /// 会话亲和共享
+    /// Session affinity sharing
     SessionAffinityBroadcast { session: SessionId, affinity: SessionAffinity },
 }
 
-/// 元数据摘要（PONG 携带）
+/// Metadata digest (carried by PONG)
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct MetaDigest {
     pub kv_version: u64,
@@ -555,7 +555,7 @@ pub enum MemberStatus {
 }
 ```
 
-## 4. 对外 API（HTTP / OpenAI 兼容）
+## 4. External API (HTTP / OpenAI Compatible)
 
 ### 4.1 Chat Completions
 
@@ -572,29 +572,29 @@ Content-Type: application/json
 }
 ```
 
-响应与 OpenAI API 完全兼容（流式 SSE 或非流式 JSON）。
+The response is fully compatible with the OpenAI API (streaming SSE or non-streaming JSON).
 
-### 4.2 管理端点
+### 4.2 Administrative Endpoints
 
 ```
-GET  /health                          # 健康检查
-GET  /v1/models                       # 列出可用模型
-GET  /admin/backends                   # 列出后端及状态
-GET  /admin/backends/:id/metrics       # 后端指标
-GET  /admin/regions                    # 列出区域
-GET  /admin/topology                   # 拓扑矩阵
-GET  /admin/routing/history            # 路由历史
-GET  /admin/routing/strategy           # 当前策略与权重
-GET  /admin/kv/index/stats             # KV Index 统计
-GET  /admin/kv/ckf/snapshot            # CKF 快照（诊断）
-POST /admin/routing/strategy           # 动态切换策略
-POST /admin/backends                   # 手动注册后端
-DELETE /admin/backends/:id             # 移除后端
+GET  /health                          # Health check
+GET  /v1/models                       # List available models
+GET  /admin/backends                   # List backends and their status
+GET  /admin/backends/:id/metrics       # Backend metrics
+GET  /admin/regions                    # List regions
+GET  /admin/topology                   # Topology matrix
+GET  /admin/routing/history            # Routing history
+GET  /admin/routing/strategy           # Current strategy and weights
+GET  /admin/kv/index/stats             # KV Index statistics
+GET  /admin/kv/ckf/snapshot            # CKF snapshot (for diagnostics)
+POST /admin/routing/strategy           # Dynamically switch strategy
+POST /admin/backends                   # Manually register a backend
+DELETE /admin/backends/:id             # Remove a backend
 ```
 
-### 4.3 路由响应头
+### 4.3 Routing Response Headers
 
-每个响应携带路由信息头（便于调试）：
+Each response carries routing-information headers (for debugging):
 
 ```
 X-Hier-KV-Gateway-Backend: cloud-beijing-worker-3
@@ -604,7 +604,7 @@ X-Hier-KV-Gateway-KV-Overlap: 8
 X-Hier-KV-Gateway-Route-Latency-Ms: 2
 ```
 
-## 5. KV Index 数据结构
+## 5. KV Index Data Structures
 
 ### 5.1 RadixTree
 
@@ -613,7 +613,7 @@ X-Hier-KV-Gateway-Route-Latency-Ms: 2
 
 use std::collections::HashMap;
 
-/// RadixTree 节点
+/// RadixTree node
 struct Node {
     hash: u64,
     owners: HashSet<(BackendId, u32)>,  // (backend_id, dp_rank)
@@ -621,9 +621,9 @@ struct Node {
     ref_count: u32,
 }
 
-/// RadixTree（线程安全，通过 channel 序列化访问）
+/// RadixTree (thread-safe; access is serialized via a channel)
 pub struct RadixTree {
-    // 通过 mpsc channel 串行化所有操作
+    // All operations are serialized via an mpsc channel
     cmd_tx: mpsc::Sender<RadixCommand>,
 }
 
@@ -670,25 +670,25 @@ const BUCKETS_PER_LANE: usize = 1 << 16;  // 65536 buckets
 const FP_PER_BUCKET: usize = 4;
 const MAX_KICKS: usize = 500;
 
-/// 单个 fingerprint（16 bit）
+/// A single fingerprint (16 bits)
 type Fp = u16;
 
-/// Packed bucket: 4 × 16bit = 64bit
+/// Packed bucket: 4 × 16 bits = 64 bits
 type PackedBucket = u64;
 
-/// CKF Producer（本地，每 pool 一个）
+/// CKF Producer (local; one per pool)
 pub struct CkfProducer {
     buckets: Vec<PackedBucket>,
     num_items: usize,
-    dirty_buckets: BitSet,       // 脏 bucket 集合
+    dirty_buckets: BitSet,       // set of dirty buckets
     pub_seq: u64,                // publication sequence
-    // 精确状态（refcount）
+    // Exact state (refcount)
     hash_refcount: HashMap<u64, u32>,  // full_hash -> refcount
     hash_owners: HashMap<u64, HashSet<WorkerWithRank>>,
 }
 
 impl CkfProducer {
-    /// 应用 KV 事件，更新 CKF
+    /// Apply a KV event, updating the CKF
     pub fn apply_event(&mut self, event: &KvCacheEvent, backend: &BackendId) {
         match event {
             KvCacheEvent::Stored { worker, block_hashes, .. } => {
@@ -758,7 +758,7 @@ impl CkfProducer {
         self.num_items -= 1;
     }
     
-    /// 发布 barrier snapshot
+    /// Publish a barrier snapshot
     pub fn snapshot(&mut self) -> CkfSnapshot {
         self.dirty_buckets.clear();
         CkfSnapshot {
@@ -767,7 +767,7 @@ impl CkfProducer {
         }
     }
     
-    /// 发布 sequenced delta
+    /// Publish a sequenced delta
     pub fn delta(&mut self) -> Option<CkfDelta> {
         if self.dirty_buckets.is_empty() { return None; }
         let dirty: Vec<(usize, PackedBucket)> = self.dirty_buckets
@@ -790,7 +790,7 @@ fn alt_index(idx: usize, fp: Fp) -> usize {
     (idx ^ h) % BUCKETS_PER_LANE
 }
 
-/// 在 packed bucket 中插入 fingerprint
+/// Insert a fingerprint into a packed bucket
 fn try_insert(bucket: &mut PackedBucket, fp: Fp) -> bool {
     for i in 0..FP_PER_BUCKET {
         let shift = i * FINGERPRINT_BITS;
@@ -803,7 +803,7 @@ fn try_insert(bucket: &mut PackedBucket, fp: Fp) -> bool {
     false
 }
 
-/// 在 packed bucket 中删除 fingerprint
+/// Delete a fingerprint from a packed bucket
 fn try_delete(bucket: &mut PackedBucket, fp: Fp) -> bool {
     for i in 0..FP_PER_BUCKET {
         let shift = i * FINGERPRINT_BITS;
@@ -816,7 +816,7 @@ fn try_delete(bucket: &mut PackedBucket, fp: Fp) -> bool {
     false
 }
 
-/// 在 packed bucket 中查找 fingerprint
+/// Look up a fingerprint in a packed bucket
 fn bucket_contains(bucket: PackedBucket, fp: Fp) -> bool {
     for i in 0..FP_PER_BUCKET {
         let slot = (bucket >> (i * FINGERPRINT_BITS)) & 0xFFFF;
@@ -826,7 +826,7 @@ fn bucket_contains(bucket: PackedBucket, fp: Fp) -> bool {
 }
 ```
 
-### 5.3 CKF Consumer（Transposed Layout）
+### 5.3 CKF Consumer (Transposed Layout)
 
 ```rust
 // crates/hier-kv-gateway-metadata/src/ckf_consumer.rs
@@ -834,13 +834,13 @@ fn bucket_contains(bucket: PackedBucket, fp: Fp) -> bool {
 const MAX_LANES: usize = 16;
 
 /// Transposed CKF Consumer
-/// 按 bucket 组织，每个 bucket 跨 lane 是一个 atomic u64
+/// Organized by bucket; each bucket is an atomic u64 across lanes
 pub struct CkfConsumer {
     /// bucket_major: [bucket][lane] → AtomicU64
     buckets: Vec<[AtomicU64; MAX_LANES]>,
-    /// lane → region 映射
+    /// lane → region mapping
     lane_regions: RwLock<HashMap<usize, RegionId>>,
-    /// lane 状态
+    /// lane status
     lane_status: [AtomicLaneStatus; MAX_LANES],
 }
 
@@ -851,7 +851,7 @@ enum LaneStatus {
 }
 
 impl CkfConsumer {
-    /// 估算请求在目标 region 的 KV overlap
+    /// Estimate the KV overlap of a request in the target region
     pub fn estimate_overlap(&self, hashes: &[u64], region: &RegionId) -> u32 {
         let lane = self.lane_regions.read().get(region)?;
         if self.lane_status[lane] != LaneStatus::Active { return 0; }
@@ -868,13 +868,13 @@ impl CkfConsumer {
                || bucket_contains(self.buckets[idx2][lane].load(Relaxed), fp) {
                 overlap += 1;
             } else {
-                break;  // 前缀中断
+                break;  // prefix break
             }
         }
         overlap
     }
     
-    /// 安装 barrier snapshot（lane 重连）
+    /// Install a barrier snapshot (lane reconnection)
     pub fn install_snapshot(&self, lane: usize, snapshot: &CkfSnapshot) {
         self.lane_status[lane].store(LaneStatus::Retired, Relaxed);
         for (idx, &bucket) in snapshot.buckets.iter().enumerate() {
@@ -883,7 +883,7 @@ impl CkfConsumer {
         self.lane_status[lane].store(LaneStatus::Active, Relaxed);
     }
     
-    /// 应用 delta
+    /// Apply a delta
     pub fn apply_delta(&self, lane: usize, delta: &CkfDelta) {
         for &(idx, bucket) in &delta.buckets {
             self.buckets[idx][lane].store(bucket, Relaxed);
@@ -892,7 +892,7 @@ impl CkfConsumer {
 }
 ```
 
-## 6. 路由引擎
+## 6. Routing Engine
 
 ```rust
 // crates/hier-kv-gateway-routing/src/engine.rs
@@ -906,13 +906,13 @@ pub struct RoutingEngine {
 }
 
 impl RoutingEngine {
-    /// 路由决策主入口
+    /// Main entry point for routing decisions
     pub async fn route(
         &self,
         ctx: &RoutingContext,
         meta: &MetadataStore,
     ) -> Result<RouteDecision> {
-        // 1. 会话亲和检查
+        // 1. Session affinity check
         if let Some(session_id) = &ctx.session_id {
             if let Some(affinity) = meta.session_get(session_id) {
                 if self.is_backend_healthy(&affinity.backend, meta).await 
@@ -926,10 +926,10 @@ impl RoutingEngine {
             }
         }
         
-        // 2. Hybrid 策略评估
+        // 2. Hybrid strategy evaluation
         let decision = self.hybrid.evaluate(ctx, &candidates, meta).await?;
         
-        // 3. 更新会话亲和
+        // 3. Update session affinity
         if let Some(session_id) = &ctx.session_id {
             meta.session_set(session_id, SessionAffinity {
                 backend: decision.backend.clone(),
@@ -950,7 +950,7 @@ pub struct RouteDecision {
 }
 ```
 
-## 7. 配置模型
+## 7. Configuration Model
 
 ```rust
 // crates/hier-kv-gateway-core/src/config.rs
@@ -999,8 +999,8 @@ pub struct StrategyWeights {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterConfig {
-    pub bind_addr: String,           // gossip 监听地址
-    pub seed_peers: Vec<String>,     // 种子节点
+    pub bind_addr: String,           // gossip listen address
+    pub seed_peers: Vec<String>,     // seed nodes
     pub gossip_interval_ms: u64,
     pub probe_timeout_ms: u64,
     pub suspect_timeout_secs: u64,

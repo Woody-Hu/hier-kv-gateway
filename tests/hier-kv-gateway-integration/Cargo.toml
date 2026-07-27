@@ -1,0 +1,22 @@
+[package]
+name = "hier-kv-gateway-integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hier-kv-gateway-core = { workspace = true }
+hier-kv-gateway-metadata = { workspace = true }
+hier-kv-gateway-routing = { workspace = true }
+hier-kv-gateway-cluster = { workspace = true }
+hier-kv-gateway-connector = { workspace = true }
+hier-kv-gateway-api = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }

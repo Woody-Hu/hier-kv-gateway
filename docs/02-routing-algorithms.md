@@ -1,4 +1,6 @@
-# Aether 路由算法设计
+# Hier KV Gateway 路由算法设计
+
+> 中文 | [English](en/02-routing-algorithms.md)
 
 > 五种路由策略 + Hybrid 混合策略的详细算法
 
@@ -28,9 +30,9 @@ struct ScoredBackend {
 
 将请求路由到 KV Cache 前缀重叠最大的后端，最大化缓存复用，减少 prefill 计算量。
 
-### 2.2 参考来源
+### 2.2 成本模型
 
-Dynamo KV Router 成本函数：
+KV Router 成本函数：
 
 ```
 adjusted_prefill_blocks = max(
@@ -44,7 +46,7 @@ adjusted_prefill_blocks = max(
 cost = prefill_load_scale * adjusted_prefill_blocks + decode_blocks
 ```
 
-### 2.3 Aether 适配算法
+### 2.3 Hier KV Gateway 适配算法
 
 云边端环境下，KV Cache 可能存在于：
 - 本地 Region 的 Backend（精确，通过 RadixTree 查询）
@@ -66,7 +68,7 @@ cost = prefill_load_scale * adjusted_prefill_blocks + decode_blocks
 
 ### 2.4 Block Hash 计算
 
-参考 Dynamo 的 `compute_block_hash_for_seq`：
+按 `compute_block_hash_for_seq` 思路：
 
 ```
 对 token 序列按 block_size 分块:
@@ -106,7 +108,7 @@ find_matches(block_hashes, target_backend):
 
 ### 2.6 CKF Consumer（跨 Region 近似查询）
 
-参考 Dynamo 的 transposed CKF：
+transposed CKF 实现：
 
 ```
 CKFConsumer:
@@ -180,9 +182,9 @@ CKFConsumer:
 
 根据后端实时负载（队列深度、GPU 利用率、活跃请求数）做负载均衡，避免热点。
 
-### 4.2 参考来源
+### 4.2 关键指标
 
-Dynamo 的 `active_decode_blocks`、`potential_prefill_tokens`、queue policy。
+`active_decode_blocks`、`potential_prefill_tokens`、queue policy。
 
 ### 4.3 算法
 
@@ -335,7 +337,7 @@ Hybrid 策略:
        weight_Topology = base_topology
   
   4. 选择 hybrid_score 最高的 b
-     若 temperature > 0: 用 softmax 采样（参考 Dynamo router_temperature）
+     若 temperature > 0: 用 softmax 采样（router_temperature）
      否则: 贪心选择
 ```
 
@@ -381,7 +383,7 @@ is_available() 检查:
       → 若 Model 不可用: 返回 503
 ```
 
-### 6.6 Softmax 采样（参考 Dynamo）
+### 6.6 Softmax 采样
 
 ```
 当 temperature > 0:

@@ -1,0 +1,17 @@
+[package]
+name = "hier-kv-gateway-routing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hier-kv-gateway-core = { workspace = true }
+hier-kv-gateway-metadata = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+xxhash-rust = { workspace = true }
+parking_lot = { workspace = true }

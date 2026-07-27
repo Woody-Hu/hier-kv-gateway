@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/aether-core",
-    "crates/aether-metadata",
-    "crates/aether-routing",
-    "crates/aether-cluster",
-    "crates/aether-connector",
-    "crates/aether-api",
-    "crates/aether-gateway",
-    "tests/aether-integration",
+    "crates/hier-kv-gateway-core",
+    "crates/hier-kv-gateway-metadata",
+    "crates/hier-kv-gateway-routing",
+    "crates/hier-kv-gateway-cluster",
+    "crates/hier-kv-gateway-connector",
+    "crates/hier-kv-gateway-api",
+    "crates/hier-kv-gateway",
+    "tests/hier-kv-gateway-integration",
 ]
 
 [workspace.package]
@@ -17,13 +17,13 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-aether-core = { path = "crates/aether-core" }
-aether-metadata = { path = "crates/aether-metadata" }
-aether-routing = { path = "crates/aether-routing" }
-aether-cluster = { path = "crates/aether-cluster" }
-aether-connector = { path = "crates/aether-connector" }
-aether-api = { path = "crates/aether-api" }
-aether-integration = { path = "tests/aether-integration" }
+hier-kv-gateway-core = { path = "crates/hier-kv-gateway-core" }
+hier-kv-gateway-metadata = { path = "crates/hier-kv-gateway-metadata" }
+hier-kv-gateway-routing = { path = "crates/hier-kv-gateway-routing" }
+hier-kv-gateway-cluster = { path = "crates/hier-kv-gateway-cluster" }
+hier-kv-gateway-connector = { path = "crates/hier-kv-gateway-connector" }
+hier-kv-gateway-api = { path = "crates/hier-kv-gateway-api" }
+hier-kv-gateway-integration = { path = "tests/hier-kv-gateway-integration" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -47,3 +47,4 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+redis = { version = "0.27", features = ["tokio-comp"] }

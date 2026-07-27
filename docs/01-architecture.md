@@ -1,4 +1,6 @@
-# Aether 架构设计文档
+# Hier KV Gateway 架构设计文档
+
+> 中文 | [English](en/01-architecture.md)
 
 > 云边端协同的 LLM 请求自动调度 Gateway 系统
 
@@ -8,7 +10,7 @@
 
 在云边端协同的 LLM 推理场景中，推理资源分布在：
 
-- **云侧（Cloud）**：具备 K8s + 分布式推理系统（如 llm-d / Dynamo）的完整集群，多机多卡，KV Cache 可跨节点共享。
+- **云侧（Cloud）**：具备 K8s + 分布式推理系统（如 llm-d）的完整集群，多机多卡，KV Cache 可跨节点共享。
 - **边侧（Edge）**：资源受限的集群或单机多卡，可能有轻量调度。
 - **端侧（Device）**：单进程推理引擎（vLLM / llama.cpp），无集群调度。
 
@@ -25,17 +27,6 @@
 7. **单进程高可用与服务降级**：预测不准时回退到基础负载均衡。
 8. **插件化**：策略、后端连接器、实例间通信均可扩展。
 
-### 1.3 与 Dynamo 的关系
-
-本系统大量参考 NVIDIA Dynamo 的设计与实现：
-
-- **Multi-DC KV Routing & DC Relay**：核心参考。Dynamo 用 DC-local Relay 聚合精确 KV 所有权，发布紧凑 Cuckoo Filter (CKF) 投影给全局 consumer，实现跨 DC 的 KV 感知路由。本系统将此模式推广到云边端。
-- **KV Router 成本函数**：参考 Dynamo 的 `cost = prefill_load_scale * adjusted_prefill_blocks + decode_blocks` 成本模型。
-- **RadixTree / KV Indexer**：参考 Dynamo 的 prefix tree 实现 KV block 重叠计算。
-- **两阶段发布 + barrier snapshot + sequenced delta**：参考其故障恢复机制。
-
-关键差异：Dynamo 聚焦数据中心内 / 数据中心间的同构推理集群；本系统面向**异构**的云边端环境（集群 vs 单进程，强调度 vs 无调度），需要更通用的后端抽象和拓扑感知。
-
 ## 2. 顶层架构
 
 ```
@@ -44,7 +35,7 @@
 └────────────────────────────────┬────────────────────────────────────┘
                                  │ HTTP/gRPC
 ┌────────────────────────────────▼────────────────────────────────────┐
-│                        Aether Gateway 进程                          │
+│                     Hier KV Gateway 进程                            │
 │  ┌──────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────────┐  │
 │  │ HTTP/API │→ │  路由引擎     │  │ 元数据存储  │  │  Gossip 层   │  │
 │  │  Server  │  │ (5种策略+混合) │  │ (内存缓存)  │  │ (集群通信)   │  │
@@ -52,10 +43,10 @@
 │                       │                │                 │          │
 │  ┌────────────────────▼────────────────▼─────────────────▼───────┐  │
 │  │                    后端连接器 (插件)                           │  │
-│  │  ┌─────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐  │  │
-│  │  │ Dynamo  │ │ vLLM     │ │llama.cpp │ │  Generic OpenAI   │  │  │
-│  │  │ Cluster │ │ Engine   │ │ Engine   │ │  Compatible      │  │  │
-│  │  └─────────┘ └──────────┘ └──────────┘ └──────────────────┘  │  │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐  │  │
+│  │  │  LLM-D   │ │ vLLM     │ │llama.cpp │ │  Generic OpenAI   │  │  │
+│  │  │ Cluster  │ │ Engine   │ │ Engine   │ │  Compatible      │  │  │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────────────┘  │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
           ▲ Gossip                    ▲ Gossip
@@ -63,7 +54,7 @@
 ┌─────────┴──────────┐       ┌─────────┴──────────┐
 │  Gateway 实例 (云)  │◄─────►│  Gateway 实例 (边)  │
 │  ┌───────────────┐ │       │ ┌────────────────┐ │
-│  │ Dynamo Cluster│ │       │ │  vLLM Engine    │ │
+│  │  LLM-D Cluster│ │       │ │  vLLM Engine    │ │
 │  │  (K8s + 多机)  │ │       │ │  (单进程)       │ │
 │  └───────────────┘ │       │ └────────────────┘ │
 └───────────────────┘       └────────────────────┘
@@ -73,7 +64,7 @@
 
 ### 3.1 Region（区域）
 
-一个 Region 对应一个逻辑部署域，类似 Dynamo 的 "DC" 概念：
+一个 Region 对应一个逻辑部署域（类似数据中心 DC 概念）：
 
 ```
 RegionId = 稳定字符串标识（如 "cloud-cn-beijing", "edge-shanghai", "device-rpi-01"）
@@ -92,12 +83,12 @@ BackendId = (RegionId, 实例标识)
 ```
 
 后端类型：
-- **Cluster Backend**：对接 Dynamo / llm-d 等分布式推理系统，多 worker，支持 KV event。
+- **Cluster Backend**：对接 llm-d 等分布式推理系统，多 worker，支持 KV event。
 - **Engine Backend**：对接 vLLM / llama.cpp 单进程引擎，可能支持 KV event 或不支持。
 
 ### 3.3 Indexer Domain（索引域）
 
-借鉴 Dynamo，标识可作为一个逻辑路由命名空间比较的缓存集合：
+标识可作为一个逻辑路由命名空间比较的缓存集合：
 
 ```
 IndexerDomainId = (模型架构 + 分词器 + KV block size + 量化配置 的哈希)
@@ -107,7 +98,7 @@ IndexerDomainId = (模型架构 + 分词器 + KV block size + 量化配置 的�
 
 ### 3.4 Pool（池）
 
-借鉴 Dynamo 的 `PoolId = (IndexerDomainId, DcId)`：
+Pool 定义为 `PoolId = (IndexerDomainId, RegionId)`：
 
 ```
 PoolId = (IndexerDomainId, RegionId)
@@ -143,7 +134,7 @@ PoolId = (IndexerDomainId, RegionId)
 │   └── CKF Relay (跨 Region KV 投影发布)             │
 ├─────────────────────────────────────────────────────┤
 │  Connector Layer (插件)                              │
-│   ├── Dynamo Connector (NATS/HTTP KV event)         │
+│   ├── LLM-D Connector (NATS/HTTP KV event)          │
 │   ├── vLLM Connector (ZMQ/HTTP KV event)            │
 │   ├── llama.cpp Connector (无 KV event, 降级)       │
 │   └── Generic OpenAI Connector (无 KV, 降级)        │
@@ -177,9 +168,9 @@ PoolId = (IndexerDomainId, RegionId)
 
 ## 5. 分布式架构
 
-### 5.1 Gossip 协议（参考 Redis Cluster）
+### 5.1 Gossip 协议
 
-Gateway 实例组跨集群通过 Gossip 通信，参考 Redis Cluster 的 Gossip 实现：
+Gateway 实例组跨集群通过 Gossip 通信：
 
 **消息类型**：
 - `PING / PONG`：心跳，携带发送方的元数据摘要。
@@ -234,7 +225,7 @@ Gateway 实例组跨集群通过 Gossip 通信，参考 Redis Cluster 的 Gossip
 降级4：返回 503 + 缓存的上一次健康后端列表
 ```
 
-## 6. KV 感知路由（核心，参考 Dynamo Multi-DC KV Routing）
+## 6. KV 感知路由（核心）
 
 ### 6.1 两阶段架构
 
@@ -269,7 +260,7 @@ Gateway 实例组跨集群通过 Gossip 通信，参考 Redis Cluster 的 Gossip
 3. **维护精确状态**：
    - `full_hash → Set<(backend_id, dp_rank)>`：每个 full block hash 被哪些 backend/rank 拥有。
    - `full_hash → refcount`：DC/Region-wide 的引用计数。
-4. **所有权变化处理**（参考 Dynamo）：
+4. **所有权变化处理**：
    - First owner of a full hash → 插入一个 CKF fingerprint
    - Another owner of same hash → refcount++ only
    - One of several removes → refcount-- only
@@ -290,7 +281,7 @@ Global Consumer 在每个 Gateway 实例内运行：
 
 ### 6.4 Cuckoo Filter 设计
 
-参考 Dynamo 的 CKF 设计：
+CKF 设计要点：
 
 - **Fingerprint**：block hash 的短指纹（如 16 bit），有损。
 - **Bucket**：每个 bucket 存放多个 fingerprint（如 4 个 × 16 bit = 64 bit packed word）。
@@ -303,7 +294,7 @@ Global Consumer 在每个 Gateway 实例内运行：
 选择 **Rust** 作为实现语言，理由：
 
 1. **性能**：Gateway 是数据面关键路径，延迟敏感。Rust 零成本抽象 + 无 GC，适合高并发低延迟。
-2. **与 Dynamo 一致**：Dynamo 核心用 Rust 实现，便于参考其数据结构和算法。
+2. **生态一致**：与同类推理基础设施项目（如 llm-d）核心语言一致，便于复用数据结构和算法思路。
 3. **内存安全**：路由元数据（KV index、CKF、load stats）并发访问频繁，Rust 的所有权模型保证线程安全。
 4. **生态**：tokio（异步运行时）、axum（HTTP）、serde（序列化）、dashmap（并发 map）等成熟。
 
@@ -419,14 +410,14 @@ pub trait ClusterTransport: Send + Sync {
 
 ### 9.2 并发安全
 
-- RadixTree：专用后台线程 + mpsc channel（参考 Dynamo），避免锁竞争。
+- RadixTree：专用后台线程 + mpsc channel，避免锁竞争。
 - Load Stats：`DashMap<BackendId, ArcSwap<Metrics>>`，读无锁、写 CAS。
-- CKF Consumer：bucket 级 atomic u64，无 lane-wide lock（参考 Dynamo）。
+- CKF Consumer：bucket 级 atomic u64，无 lane-wide lock。
 - Model Registry：`Arc<RwLock<...>>`，读多写少。
 
 ## 10. 故障恢复
 
-参考 Dynamo 的 "narrowest state boundary" 原则：
+按 "narrowest state boundary" 原则设计故障恢复边界：
 
 | 故障 | 恢复边界 | 行为 |
 |------|---------|------|
@@ -439,16 +430,16 @@ pub trait ClusterTransport: Send + Sync {
 ## 11. 目录结构规划
 
 ```
-aether/
+hier-kv-gateway/
 ├── Cargo.toml                 # workspace 根
 ├── crates/
-│   ├── aether-core/           # 核心类型: BackendId, RegionId, 元数据模型
-│   ├── aether-metadata/       # 元数据存储: RadixTree, CKF, LoadStats, ModelRegistry
-│   ├── aether-routing/        # 路由引擎: 5种策略 + Hybrid
-│   ├── aether-cluster/         # Gossip 集群通信 + CKF Relay
-│   ├── aether-connector/       # 后端连接器 trait + 内置实现
-│   ├── aether-api/             # HTTP API server (OpenAI 兼容)
-│   └── aether-gateway/        # 主二进制: 组装所有组件
+│   ├── hier-kv-gateway-core/           # 核心类型: BackendId, RegionId, 元数据模型
+│   ├── hier-kv-gateway-metadata/       # 元数据存储: RadixTree, CKF, LoadStats, ModelRegistry
+│   ├── hier-kv-gateway-routing/        # 路由引擎: 5种策略 + Hybrid
+│   ├── hier-kv-gateway-cluster/         # Gossip 集群通信 + CKF Relay
+│   ├── hier-kv-gateway-connector/       # 后端连接器 trait + 内置实现
+│   ├── hier-kv-gateway-api/             # HTTP API server (OpenAI 兼容)
+│   └── hier-kv-gateway/                # 主二进制: 组装所有组件
 ├── tests/                     # 集成测试 (真实后端, 无 mock)
 ├── docs/                      # 设计文档
 └── examples/                  # 配置示例

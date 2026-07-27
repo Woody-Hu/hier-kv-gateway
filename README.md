@@ -1,4 +1,6 @@
-# Aether
+# Hier KV Gateway
+
+> 中文 | [English](README.en.md)
 
 > 云边端协同的 LLM 请求自动调度 Gateway 系统
 
@@ -8,7 +10,7 @@
 
 ## 概述
 
-Aether 是一个面向**云边端协同**场景的 LLM 推理请求自动调度网关。它将分布在不同地理位置、不同规模、不同引擎的推理后端（云侧 K8s+Dynamo 集群、边侧轻量集群、端侧 vLLM/llama.cpp 单进程）统一为一个推理服务入口，通过智能路由策略将请求自动调度到最合适的后端。
+Hier KV Gateway 是一个面向**云边端协同**场景的 LLM 推理请求自动调度网关。它将分布在不同地理位置、不同规模、不同引擎的推理后端（云侧 K8s 集群、边侧轻量集群、端侧 vLLM/llama.cpp 单进程）统一为一个推理服务入口，通过智能路由策略将请求自动调度到最合适的后端。
 
 ### 核心能力
 
@@ -25,18 +27,6 @@ Aether 是一个面向**云边端协同**场景的 LLM 推理请求自动调度�
 | **服务降级** | 元数据不可用时自动降级到次优策略，最终回退到基础负载均衡 |
 | **OpenAI 兼容 API** | 完全兼容 OpenAI Chat Completions API，支持流式 SSE |
 
-### 与 Dynamo 的关系
-
-本系统大量参考 NVIDIA Dynamo 的设计与实现，特别是 **Multi-DC KV Routing 和 DC Relay**：
-
-- **两阶段架构**：Stage 1 在本地 Region 聚合精确 KV 所有权（full hash + refcount），Stage 2 发布紧凑 Cuckoo Filter (CKF) 投影给跨域 consumer。
-- **KV Router 成本函数**：参考 `cost = prefill_load_scale * adjusted_prefill_blocks + decode_blocks`。
-- **RadixTree**：参考 Dynamo 的 prefix tree 实现 KV block 重叠计算。
-- **Barrier Snapshot + Sequenced Delta**：参考其故障恢复机制。
-- **所有权 refcount 四分支**：first owner 插入 / another owner refcount++ / remove one refcount-- / final owner 删除。
-
-关键差异：Dynamo 聚焦数据中心内/间的同构推理集群；Aether 面向**异构**的云边端环境（集群 vs 单进程，强调度 vs 无调度），提供更通用的后端抽象和拓扑感知。
-
 ## 架构
 
 ```
@@ -45,7 +35,7 @@ Aether 是一个面向**云边端协同**场景的 LLM 推理请求自动调度�
 └────────────────────────────────┬────────────────────────────────────┘
                                  │ HTTP
 ┌────────────────────────────────▼────────────────────────────────────┐
-│                        Aether Gateway 进程                          │
+│                     Hier KV Gateway 进程                             │
 │  ┌──────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────────┐  │
 │  │ HTTP/API │→ │  路由引擎     │  │ 元数据存储  │  │  Gossip 层   │  │
 │  │  Server  │  │ (5种策略+混合) │  │ (内存缓存)  │  │ (集群通信)   │  │
@@ -53,10 +43,10 @@ Aether 是一个面向**云边端协同**场景的 LLM 推理请求自动调度�
 │                       │                │                 │          │
 │  ┌────────────────────▼────────────────▼─────────────────▼───────┐  │
 │  │                    后端连接器 (插件)                           │  │
-│  │  ┌─────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐  │  │
-│  │  │ Dynamo  │ │ vLLM     │ │llama.cpp │ │  Generic OpenAI   │  │  │
-│  │  │ Cluster │ │ Engine   │ │ Engine   │ │  Compatible      │  │  │
-│  │  └─────────┘ └──────────┘ └──────────┘ └──────────────────┘  │  │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐  │  │
+│  │  │  LLM-D   │ │ vLLM     │ │llama.cpp │ │  Generic OpenAI   │  │  │
+│  │  │ Cluster  │ │ Engine   │ │ Engine   │ │  Compatible      │  │  │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────────────┘  │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
           ▲ Gossip                    ▲ Gossip
@@ -64,7 +54,7 @@ Aether 是一个面向**云边端协同**场景的 LLM 推理请求自动调度�
 ┌─────────┴──────────┐       ┌─────────┴──────────┐
 │  Gateway (云)       │◄─────►│  Gateway (边)      │
 │  ┌───────────────┐ │       │ ┌────────────────┐ │
-│  │ Dynamo Cluster│ │       │ │  vLLM Engine    │ │
+│  │  LLM-D Cluster│ │       │ │  vLLM Engine    │ │
 │  │  (K8s + 多机)  │ │       │ │  (单进程)       │ │
 │  └───────────────┘ │       │ └────────────────┘ │
 └───────────────────┘       └────────────────────┘
@@ -110,20 +100,20 @@ cargo build --release
 cargo test --workspace
 
 # 仅集成测试
-cargo test -p aether-integration
+cargo test -p hier-kv-gateway-integration
 
 # 仅端到端测试
-cargo test --test end_to_end -p aether-integration -- --nocapture
+cargo test --test end_to_end -p hier-kv-gateway-integration -- --nocapture
 ```
 
 ### 启动 Gateway
 
 ```bash
 # 使用示例配置
-cargo run --release -- --config examples/aether.toml
+cargo run --release -- --config examples/hier-kv-gateway.toml
 ```
 
-示例配置 ([examples/aether.toml](examples/aether.toml)):
+示例配置 ([examples/hier-kv-gateway.toml](examples/hier-kv-gateway.toml)):
 
 ```toml
 instance_id = "gateway-1"
@@ -181,16 +171,16 @@ curl http://localhost:8080/v1/chat/completions \
 
 # 查看路由决策信息（响应头）
 curl -v http://localhost:8080/v1/chat/completions ...
-# X-Aether-Backend: cloud-beijing-worker-3
-# X-Aether-Strategy: hybrid
-# X-Aether-KV-Overlap: 8
+# X-Hier-KV-Gateway-Backend: cloud-beijing-worker-3
+# X-Hier-KV-Gateway-Strategy: hybrid
+# X-Hier-KV-Gateway-KV-Overlap: 8
 ```
 
 ## 路由策略
 
 ### 1. KV 感知路由 (KV Aware)
 
-参考 Dynamo KV Router 成本函数：
+成本函数：
 
 ```
 total_overlap = device_overlap(本地 RadixTree) + ckf_overlap(跨域 CKF)
@@ -200,7 +190,7 @@ cost = prefill_load_scale * prefill_blocks + decode_blocks
 score = 1.0 / (1.0 + cost)
 ```
 
-**所有权 refcount 四分支**（参考 Dynamo DC Relay）：
+**所有权 refcount 四分支**：
 - First owner of a hash → 插入 CKF fingerprint
 - Another owner of same hash → refcount++ only
 - One of several removes → refcount-- only
@@ -279,13 +269,11 @@ L4: Cold Metadata   - RoutingHistory(TTL 300s), DegradationStats(TTL 60s)
 ```
 
 并发安全设计：
-- RadixTree：专用后台线程 + mpsc channel（参考 Dynamo）
+- RadixTree：专用后台线程 + mpsc channel，避免锁竞争
 - LoadStats：`DashMap<BackendId, ArcSwap<Metrics>>`，读无锁
-- CKF Consumer：bucket 级 atomic u64，无 lane-wide lock（参考 Dynamo）
+- CKF Consumer：bucket 级 atomic u64，无 lane-wide lock
 
 ## Gossip 集群通信
-
-参考 Redis Cluster 的 Gossip 实现：
 
 | 消息类型 | 用途 |
 |---------|------|
@@ -308,7 +296,7 @@ L4: Cold Metadata   - RoutingHistory(TTL 300s), DegradationStats(TTL 60s)
 #[async_trait]
 pub trait RoutingStrategy: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn evaluate(&self, ctx: &RoutingContext, candidates: &[BackendId], 
+    async fn evaluate(&self, ctx: &RoutingContext, candidates: &[BackendId],
                       meta: &MetadataStore) -> Result<Vec<ScoredBackend>>;
     fn is_available(&self, meta: &MetadataStore) -> bool;
     fn weight(&self) -> f64;
@@ -323,10 +311,10 @@ pub trait BackendConnector: Send + Sync {
     fn backend_type(&self) -> BackendType;
     async fn discover(&self) -> Result<Vec<BackendInfo>>;
     async fn health_check(&self, backend: &BackendId) -> Result<HealthStatus>;
-    async fn forward(&self, backend: &BackendId, request: &InferenceRequest) 
+    async fn forward(&self, backend: &BackendId, request: &InferenceRequest)
         -> Result<BoxStream<'static, InferenceChunk>>;
     fn supports_kv_events(&self) -> bool;
-    async fn subscribe_kv_events(&self, backend: &BackendId) 
+    async fn subscribe_kv_events(&self, backend: &BackendId)
         -> Result<BoxStream<'static, KvCacheEvent>>;
     async fn collect_metrics(&self, backend: &BackendId) -> Result<BackendMetrics>;
 }
@@ -355,28 +343,28 @@ pub trait ClusterTransport: Send + Sync {
 | GET | `/admin/backends` | 后端列表与状态 |
 | GET | `/admin/backends/:id/metrics` | 后端指标 |
 
-响应头携带路由信息：`X-Aether-Backend`, `X-Aether-Strategy`, `X-Aether-KV-Overlap`
+响应头携带路由信息：`X-Hier-KV-Gateway-Backend`, `X-Hier-KV-Gateway-Strategy`, `X-Hier-KV-Gateway-KV-Overlap`
 
 ## 项目结构
 
 ```
-aether/
+hier-kv-gateway/
 ├── crates/
-│   ├── aether-core/           # 核心类型: IDs, BackendInfo, Metrics, Config
-│   ├── aether-metadata/       # 元数据: RadixTree, CKF, LoadStats, ModelRegistry
-│   ├── aether-routing/        # 路由引擎: 5种策略 + Hybrid
-│   ├── aether-cluster/        # Gossip 集群通信 + CKF Relay
-│   ├── aether-connector/      # 后端连接器: OpenAI兼容/vLLM
-│   ├── aether-api/            # HTTP API Server (OpenAI 兼容)
-│   └── aether-gateway/        # 主二进制
+│   ├── hier-kv-gateway-core/           # 核心类型: IDs, BackendInfo, Metrics, Config
+│   ├── hier-kv-gateway-metadata/       # 元数据: RadixTree, CKF, LoadStats, ModelRegistry
+│   ├── hier-kv-gateway-routing/        # 路由引擎: 5种策略 + Hybrid
+│   ├── hier-kv-gateway-cluster/        # Gossip 集群通信 + CKF Relay
+│   ├── hier-kv-gateway-connector/      # 后端连接器: OpenAI兼容/vLLM
+│   ├── hier-kv-gateway-api/            # HTTP API Server (OpenAI 兼容)
+│   └── hier-kv-gateway/                # 主二进制
 ├── tests/
-│   └── aether-integration/    # 集成测试（无 mock）
+│   └── hier-kv-gateway-integration/    # 集成测试（无 mock）
 ├── docs/
 │   ├── 01-architecture.md      # 架构设计文档
 │   ├── 02-routing-algorithms.md # 路由算法设计文档
 │   └── 03-interfaces-data-models.md # 接口与数据模型文档
 └── examples/
-    └── aether.toml             # 配置示例
+    └── hier-kv-gateway.toml             # 配置示例
 ```
 
 ## 测试
@@ -385,12 +373,12 @@ aether/
 
 | 测试套件 | 数量 | 说明 |
 |---------|------|------|
-| aether-core | 48 | 类型序列化、配置解析、地理距离计算 |
-| aether-metadata | 22 | RadixTree 事件处理、CKF insert/delete/lookup |
-| aether-routing | 3 | 混合策略评分、softmax 采样 |
-| aether-cluster | 26 | Gossip 成员管理、CKF Relay 发布 |
-| aether-connector | 6 | Prometheus 指标解析、连接器注册 |
-| aether-api | 20 | HTTP 路由、SSE 转换、响应头 |
+| hier-kv-gateway-core | 48 | 类型序列化、配置解析、地理距离计算 |
+| hier-kv-gateway-metadata | 22 | RadixTree 事件处理、CKF insert/delete/lookup |
+| hier-kv-gateway-routing | 3 | 混合策略评分、softmax 采样 |
+| hier-kv-gateway-cluster | 26 | Gossip 成员管理、CKF Relay 发布 |
+| hier-kv-gateway-connector | 6 | Prometheus 指标解析、连接器注册 |
+| hier-kv-gateway-api | 20 | HTTP 路由、SSE 转换、响应头 |
 | **集成测试** | **14** | **真实组件端到端** |
 | **合计** | **139** | |
 
@@ -409,18 +397,13 @@ aether/
 
 ## 技术栈
 
-- **语言**: Rust (性能、内存安全、与 Dynamo 一致)
+- **语言**: Rust (性能、内存安全)
 - **异步运行时**: tokio
 - **HTTP 框架**: axum
 - **HTTP 客户端**: reqwest
 - **序列化**: serde / serde_json / toml
 - **哈希**: xxhash-rust (xxh3)
 - **并发**: dashmap, arc-swap, parking_lot
-
-## 致谢
-
-- [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) - Multi-DC KV Routing, DC Relay, KV Router 成本函数, RadixTree
-- [Redis Cluster](https://redis.io/docs/reference/cluster-spec/) - Gossip 协议设计参考
 
 ## License
 
