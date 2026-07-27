@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Enable the native NVIDIA Dynamo connector backed by NATS. When disabled,
+# `DynamoConnector` is a thin stub that delegates to the OpenAI-compatible
+# HTTP connector and reports `supports_kv_events() == false`.
+default = []
+dynamo = ["async-nats"]
+
 [dependencies]
 hier-kv-gateway-core = { workspace = true }
 async-trait = { workspace = true }
@@ -19,3 +26,5 @@ parking_lot = { workspace = true }
 dashmap = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+# Optional: real NATS client used by the Dynamo connector.
+async-nats = { version = "0.38", optional = true }

@@ -1,0 +1,102 @@
+# Hier KV Gateway multi-backend example configuration.
+#
+# This file demonstrates a single gateway instance routing across a
+# heterogeneous fleet of backends:
+#
+#   - A vLLM engine on localhost:8000
+#   - A vLLM engine on localhost:8001 (second GPU)
+#   - An LLM-D cluster reachable at http://10.0.0.10:8080
+#   - A NVIDIA Dynamo worker reachable via NATS at nats://10.0.0.20:4222
+#
+# The gateway uses the hybrid routing strategy so requests are routed by
+# KV-cache overlap + load + topology, with session affinity keeping
+# multi-turn conversations sticky to the same backend whenever possible.
+#
+# All backends share `kv_block_size = 16` so the gateway can compare
+# prefix hashes across the whole fleet.
+#
+# Usage:
+#   hier-kv-gateway --config examples/multi-backend.toml
+#
+# NOTE: To enable the native Dynamo connector (NATS), build the gateway
+# binary with:
+#   cargo build --release --features hier-kv-gateway-connector/dynamo
+# When the feature is disabled the Dynamo backend falls back to an
+# OpenAI-compatible HTTP path (and reports `supports_kv_events = false`).
+
+instance_id = "gateway-multi-1"
+
+[region]
+id = "cloud-cn-beijing"
+tier = "cloud"
+network_zone = "cn-beijing-1"
+geo = { lat = 39.9, lon = 116.4 }
+
+[listen]
+addr = "0.0.0.0"
+port = 8080
+
+[routing]
+strategy = "hybrid"
+kv_block_size = 16
+overlap_score_credit = 1.0
+prefill_load_scale = 1.0
+temperature = 0.0
+session_affinity_ttl_secs = 300
+max_retries = 3
+
+[routing.weights]
+kv = 0.35
+load = 0.30
+topology = 0.20
+
+[cluster]
+bind_addr = "0.0.0.0:7946"
+seed_peers = []
+gossip_interval_ms = 1000
+probe_timeout_ms = 5000
+suspect_timeout_secs = 10
+
+# ----------------------------------------------------------------------
+# Backend 1: vLLM on GPU 0 (localhost:8000)
+# ----------------------------------------------------------------------
+[[backends]]
+backend_type = "vllm_engine"
+endpoint = { url = "http://localhost:8000", protocol = "http" }
+models = ["qwen2.5-7b"]
+region = "cloud-cn-beijing"
+kv_block_size = 16
+
+# ----------------------------------------------------------------------
+# Backend 2: vLLM on GPU 1 (localhost:8001) — same model, more capacity
+# ----------------------------------------------------------------------
+[[backends]]
+backend_type = "vllm_engine"
+endpoint = { url = "http://localhost:8001", protocol = "http" }
+models = ["qwen2.5-7b"]
+region = "cloud-cn-beijing"
+kv_block_size = 16
+
+# ----------------------------------------------------------------------
+# Backend 3: LLM-D cluster (remote HTTP endpoint)
+# ----------------------------------------------------------------------
+[[backends]]
+backend_type = "llm_d_cluster"
+endpoint = { url = "http://10.0.0.10:8080", protocol = "http" }
+models = ["llama-3.1-8b"]
+region = "cloud-cn-beijing"
+kv_block_size = 16
+
+# ----------------------------------------------------------------------
+# Backend 4: NVIDIA Dynamo worker (NATS)
+#
+# The endpoint URL must be a nats:// URL when the `dynamo` connector
+# feature is enabled. The instance id used in NATS subjects is derived
+# from the host:port portion of the URL (10.0.0.20:4222 here).
+# ----------------------------------------------------------------------
+[[backends]]
+backend_type = "dynamo_engine"
+endpoint = { url = "nats://10.0.0.20:4222", protocol = "nats" }
+models = ["qwen2.5-7b"]
+region = "cloud-cn-beijing"
+kv_block_size = 16

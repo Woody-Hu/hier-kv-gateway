@@ -5,7 +5,6 @@
 //! (`stream: true`), and parses the SSE (Server-Sent Events) stream to return a sequence
 //! of [`InferenceChunk`].
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use hier_kv_gateway_core::backend::{
@@ -15,12 +14,11 @@ use hier_kv_gateway_core::backend::{
 use hier_kv_gateway_core::error::{HierKvGatewayError, Result};
 use hier_kv_gateway_core::ids::{BackendId, BackendInstanceId, IndexerDomainId, RegionId};
 use hier_kv_gateway_core::kv_event::KvCacheEvent;
-use hier_kv_gateway_core::metrics::{BackendMetrics, LatencyStats};
+use hier_kv_gateway_core::metrics::BackendMetrics;
 use hier_kv_gateway_core::request::{InferenceChunk, InferenceRequest};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::connector::{BackendConnector, HealthStatus};

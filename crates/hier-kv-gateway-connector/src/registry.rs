@@ -6,13 +6,14 @@
 
 use std::sync::Arc;
 
-use hier_kv_gateway_core::backend::{BackendType, Endpoint};
+use hier_kv_gateway_core::backend::BackendType;
 use hier_kv_gateway_core::config::BackendConfig;
 use hier_kv_gateway_core::ids::RegionId;
 
 use dashmap::DashMap;
 
 use crate::connector::BackendConnector;
+use crate::dynamo::{DynamoConnector, DynamoConnectorConfig};
 use crate::openai_compat::OpenAICompatConnector;
 
 /// Connector registry, indexed by backend type.
@@ -48,8 +49,11 @@ impl ConnectorRegistry {
     /// Create a registry from a list of backend configs.
     ///
     /// For each [`BackendConfig`] a corresponding connector instance is created:
-    /// - `VllmEngine` / `LlamaCppEngine` / `GenericOpenAI` / `LlmDCluster` -> [`OpenAICompatConnector`]
-    pub fn from_configs(configs: &[BackendConfig], region: &RegionId) -> Self {
+    /// - `VllmEngine` / `LlamaCppEngine` / `GenericOpenAI` / `LlmDCluster` ->
+    ///   [`OpenAICompatConnector`]
+    /// - `DynamoEngine` -> [`DynamoConnector`] (uses the endpoint URL as the
+    ///   NATS URL; falls back to HTTP when the `dynamo` feature is disabled)
+    pub fn from_configs(configs: &[BackendConfig], _region: &RegionId) -> Self {
         let registry = Self::new();
 
         for cfg in configs {
@@ -64,6 +68,24 @@ impl ConnectorRegistry {
                     cfg.models.clone(),
                     cfg.kv_block_size,
                 )),
+                BackendType::DynamoEngine => {
+                    // Derive a stable instance id from the endpoint URL
+                    // (host:port) when the config does not provide one.
+                    let instance_id = cfg
+                        .endpoint
+                        .url
+                        .replace("nats://", "")
+                        .replace("http://", "")
+                        .replace("https://", "");
+                    let dynamo_cfg = DynamoConnectorConfig::from_endpoint(
+                        &cfg.endpoint,
+                        &cfg.region,
+                        instance_id,
+                        cfg.models.clone(),
+                        cfg.kv_block_size,
+                    );
+                    Arc::new(DynamoConnector::new(dynamo_cfg)) as Arc<dyn BackendConnector>
+                }
             };
             registry.register(connector);
         }
@@ -81,6 +103,7 @@ impl Default for ConnectorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hier_kv_gateway_core::backend::Endpoint;
 
     #[test]
     fn registry_get_after_register() {
@@ -114,6 +137,24 @@ mod tests {
 
         let registry = ConnectorRegistry::from_configs(&configs, &RegionId::new("edge-1"));
         assert!(registry.get(&BackendType::VllmEngine).is_some());
+        assert_eq!(registry.registered_types().len(), 1);
+    }
+
+    #[test]
+    fn from_configs_creates_dynamo_connector() {
+        let configs = vec![BackendConfig {
+            backend_type: BackendType::DynamoEngine,
+            endpoint: Endpoint {
+                url: "nats://localhost:4222".to_string(),
+                protocol: hier_kv_gateway_core::backend::Protocol::Nats,
+            },
+            models: vec!["llama-3.1-8b".to_string()],
+            region: RegionId::new("cloud-1"),
+            kv_block_size: 16,
+            quantization: None,
+        }];
+        let registry = ConnectorRegistry::from_configs(&configs, &RegionId::new("cloud-1"));
+        assert!(registry.get(&BackendType::DynamoEngine).is_some());
         assert_eq!(registry.registered_types().len(), 1);
     }
 }

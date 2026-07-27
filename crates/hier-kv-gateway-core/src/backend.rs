@@ -21,6 +21,13 @@ pub enum BackendType {
     LlamaCppEngine,
     /// Generic backend compatible with the OpenAI API.
     GenericOpenAI,
+    /// NVIDIA Dynamo backend (NATS-based component bus).
+    ///
+    /// Enabled when the `dynamo` connector feature is turned on in the
+    /// `hier_kv_gateway_connector` crate. Routing behaves identically to the
+    /// OpenAI-compatible connector when the feature is disabled; the variant
+    /// is always present so that configs and serialized state remain stable.
+    DynamoEngine,
 }
 
 /// Network protocol.

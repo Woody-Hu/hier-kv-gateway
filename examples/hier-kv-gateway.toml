@@ -1,14 +1,14 @@
-# Hier KV Gateway 示例配置
+# Hier KV Gateway example configuration.
 #
-# 该文件演示了一个典型的单节点 Hier KV Gateway 网关配置：
-# - 实例身份：gateway-1
-# - 区域：北京云区域
-# - 监听：0.0.0.0:8080
-# - 路由策略：hybrid (KV + 负载 + 拓扑 加权混合)
-# - 集群：本地 7946 端口（无种子节点，单节点模式）
-# - 后端：单个 vLLM 引擎实例（运行在本机 8000 端口）
+# This file demonstrates a typical single-node Hier KV Gateway configuration:
+# - Instance identity: gateway-1
+# - Region: cloud-cn-beijing
+# - Listen: 0.0.0.0:8080
+# - Routing strategy: hybrid (weighted mix of KV / load / topology)
+# - Cluster: local port 7946 (no seed peers, single-node mode)
+# - Backend: a single vLLM engine instance running on localhost:8000
 #
-# 使用方式：
+# Usage:
 #   hier-kv-gateway --config examples/hier-kv-gateway.toml
 
 instance_id = "gateway-1"
