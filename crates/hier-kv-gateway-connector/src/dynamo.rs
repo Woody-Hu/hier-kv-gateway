@@ -181,16 +181,16 @@ mod native {
                 })
                 .await
         }
-
-        fn backend_id(&self) -> BackendId {
-            BackendId::new(self.config.region.clone(), self.config.instance_id.clone())
-        }
     }
 
     #[async_trait]
     impl BackendConnector for DynamoConnector {
         fn backend_type(&self) -> BackendType {
             BackendType::DynamoEngine
+        }
+
+        fn backend_id(&self) -> BackendId {
+            BackendId::new(self.config.region.clone(), self.config.instance_id.clone())
         }
 
         async fn discover(&self) -> Result<Vec<BackendInfo>> {
@@ -449,6 +449,10 @@ mod stub {
     impl BackendConnector for DynamoConnector {
         fn backend_type(&self) -> BackendType {
             BackendType::DynamoEngine
+        }
+
+        fn backend_id(&self) -> BackendId {
+            self.http_fallback.backend_id()
         }
 
         async fn discover(&self) -> Result<Vec<BackendInfo>> {

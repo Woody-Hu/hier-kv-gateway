@@ -9,6 +9,7 @@
 //! - [`load_aware::LoadAwareStrategy`]: strategy based on backend load metrics.
 //! - [`topology_aware::TopologyAwareStrategy`]: topology-aware strategy based on inter-Region RTT.
 //! - [`hybrid::HybridStrategy`]: the default hybrid strategy, fusing the sub-strategies above and scoring by weight.
+//! - [`round_robin::RoundRobinStrategy`]: metadata-free baseline that rotates through the candidate set in order.
 //! - [`engine::RoutingEngine`]: the upper-level routing engine, integrating session affinity and the hybrid strategy to produce [`engine::RouteDecision`].
 //! - [`prefix_history::PrefixReuseHistory`]: local prefix reuse history, recording dispatch decisions for degradation routing replay.
 //! - [`degradation::DegradationStrategy`]: degradation routing strategy based on prefix reuse history when metadata is missing or stale.
@@ -19,6 +20,7 @@ pub mod model_aware;
 pub mod load_aware;
 pub mod topology_aware;
 pub mod hybrid;
+pub mod round_robin;
 pub mod prefix_history;
 pub mod degradation;
 pub mod engine;

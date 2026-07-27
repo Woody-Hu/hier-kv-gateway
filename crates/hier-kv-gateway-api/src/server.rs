@@ -103,7 +103,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_route_returns_ok() {
-        let state = build_test_app_state("test-region");
+        let state = Arc::new(build_test_app_state("test-region"));
         let app = create_router(state);
         let resp = app
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
@@ -117,7 +117,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_models_returns_empty_when_no_backends() {
-        let state = build_test_app_state("test-region");
+        let state = Arc::new(build_test_app_state("test-region"));
         let app = create_router(state);
         let resp = app
             .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
@@ -133,7 +133,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_backends_returns_empty_when_no_backends() {
-        let state = build_test_app_state("test-region");
+        let state = Arc::new(build_test_app_state("test-region"));
         let app = create_router(state);
         let resp = app
             .oneshot(
@@ -153,7 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_metrics_invalid_id_returns_400() {
-        let state = build_test_app_state("test-region");
+        let state = Arc::new(build_test_app_state("test-region"));
         let app = create_router(state);
         // A backend id without `/` should be rejected
         let resp = app
@@ -175,7 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_metrics_missing_backend_returns_404() {
-        let state = build_test_app_state("test-region");
+        let state = Arc::new(build_test_app_state("test-region"));
         let app = create_router(state);
         let resp = app
             .oneshot(
@@ -195,7 +195,7 @@ mod tests {
     async fn cluster_peers_returns_503_when_no_registrar() {
         // build_test_app_state wires up AppState with `peer_registrar: None`,
         // simulating a gateway started without a cluster transport.
-        let state = build_test_app_state("test-region");
+        let state = Arc::new(build_test_app_state("test-region"));
         let app = create_router(state);
         let resp = app
             .oneshot(

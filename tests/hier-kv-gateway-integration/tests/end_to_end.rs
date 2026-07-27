@@ -18,7 +18,7 @@ use hier_kv_gateway_connector::connector::BackendConnector;
 use hier_kv_gateway_connector::openai_compat::OpenAICompatConnector;
 use hier_kv_gateway_connector::registry::ConnectorRegistry;
 use hier_kv_gateway_core::backend::{BackendType, Endpoint, Protocol};
-use hier_kv_gateway_core::config::{RoutingConfig, StrategyType, StrategyWeights};
+use hier_kv_gateway_core::config::StrategyWeights;
 use hier_kv_gateway_core::ids::RegionId;
 use hier_kv_gateway_core::request::InferenceChunk;
 use hier_kv_gateway_metadata::store::MetadataStore;
@@ -203,8 +203,8 @@ async fn end_to_end_discover_route_forward() {
         .expect("routing decision should succeed");
     println!("routing decision: backend={}, strategy={}", decision.backend, decision.strategy);
 
-    // 10. Forward the request via the connector
-    let connector = registry.get(&BackendType::VllmEngine).expect("should be able to find the connector");
+    // 10. Forward the request via the connector (addressed by backend id)
+    let connector = registry.get(&decision.backend).expect("should be able to find the connector");
     let mut stream = connector
         .forward(&decision.backend, &request)
         .await

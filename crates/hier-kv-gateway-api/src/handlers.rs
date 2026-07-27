@@ -30,6 +30,7 @@ use hier_kv_gateway_core::metrics::BackendMetrics;
 use hier_kv_gateway_core::request::{InferenceChunk, InferenceRequest, RoutingContext};
 
 use hier_kv_gateway_connector::registry::ConnectorRegistry;
+use hier_kv_gateway_connector::resilience::{CircuitBreakerRegistry, RetryPolicy};
 use hier_kv_gateway_metadata::store::MetadataStore;
 use hier_kv_gateway_routing::engine::{RouteDecision, RoutingEngine};
 
@@ -60,6 +61,11 @@ pub struct AppState {
     pub connectors: Arc<ConnectorRegistry>,
     /// Routing configuration (provides parameters such as kv_block_size).
     pub routing_config: RoutingConfig,
+    /// Per-backend circuit breakers consulted by the forwarding loop: a
+    /// backend with an open circuit is skipped instead of retried.
+    pub breakers: Arc<CircuitBreakerRegistry>,
+    /// Exponential backoff policy applied between two forward attempts.
+    pub retry_policy: RetryPolicy,
     /// Optional peer registrar (backed by `GossipEngine` when cluster mode is enabled).
     ///
     /// When `None`, the `POST /cluster/peers` endpoint returns `503 Service Unavailable`,
@@ -152,71 +158,147 @@ pub async fn chat_completions(
         requires_tool_calling: !inference.tools.is_empty(),
     };
 
-    // 3) Routing decision
-    let decision = match state.routing.route(&ctx, &state.metadata).await {
-        Ok(d) => d,
+    // 3) Routing decision: fetch up to `1 + max_retries` ranked candidates so the
+    //    forwarding loop can fail over to the next-best backend on errors.
+    let max_attempts = state.routing_config.max_retries.saturating_add(1) as usize;
+    let decisions = match state
+        .routing
+        .route_candidates(&ctx, &state.metadata, max_attempts)
+        .await
+    {
+        Ok(d) if !d.is_empty() => d,
+        Ok(_) => {
+            let e = HierKvGatewayError::BackendUnavailable;
+            error!(request_id = %request_id, error = %e, "routing failed");
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, &e);
+        }
         Err(e) => {
             error!(request_id = %request_id, error = %e, "routing failed");
             return error_response(StatusCode::SERVICE_UNAVAILABLE, &e);
         }
     };
-    let routing_meta = RoutingMeta::from_decision(&decision);
-    debug!(
-        request_id = %request_id,
-        backend = %routing_meta.backend,
-        strategy = %routing_meta.strategy,
-        kv_overlap = routing_meta.kv_overlap,
-        "routing decision completed"
-    );
 
-    // 4) Take out the connector
-    let backend_info = match state.metadata.backend_get(&decision.backend) {
-        Some(info) => info,
-        None => {
-            error!(backend = %decision.backend, "backend selected by routing is not in MetadataStore");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &HierKvGatewayError::NotFound(format!("backend {} not registered", decision.backend)),
+    // 4) Forward along the ranked candidates with circuit-breaker gating and
+    //    exponential backoff between attempts. The first candidate that yields
+    //    a chunk stream wins; its decision metadata is reported to the client.
+    match forward_with_retries(&state, &decisions, &inference, &request_id).await {
+        Ok((chunk_stream, routing_meta)) => {
+            debug!(
+                request_id = %request_id,
+                backend = %routing_meta.backend,
+                strategy = %routing_meta.strategy,
+                kv_overlap = routing_meta.kv_overlap,
+                "routing decision completed"
             );
-        }
-    };
-    let backend_type = backend_info.backend_type.clone();
-    let connector = match state.connectors.get(&backend_type) {
-        Some(c) => c,
-        None => {
-            error!(backend_type = ?backend_type, "no connector registered for this backend type");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &HierKvGatewayError::ConnectorError(format!(
-                    "no connector for backend_type {:?}",
-                    backend_type
-                )),
-            );
-        }
-    };
-
-    // 5) Forward the request and obtain the chunk stream
-    let chunk_stream: BoxStream<'static, InferenceChunk> =
-        match connector.forward(&decision.backend, &inference).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!(request_id = %request_id, error = %e, "backend forwarding failed");
-                return error_response(StatusCode::BAD_GATEWAY, &e);
+            // 5) Build the response based on the stream field
+            if stream_mode {
+                build_sse_response(chunk_stream, &request_id, &model_name, &routing_meta)
+            } else {
+                build_non_stream_response(
+                    chunk_stream,
+                    &request_id,
+                    &model_name,
+                    &routing_meta,
+                    &inference,
+                )
+                .await
             }
+        }
+        Err(e) => {
+            error!(request_id = %request_id, error = %e, "backend forwarding failed");
+            error_response(StatusCode::BAD_GATEWAY, &e)
+        }
+    }
+}
+
+/// Attempt to forward `inference` to the ranked `decisions` in order.
+///
+/// For each candidate:
+/// 1. Skip backends whose circuit is currently open ([`CircuitBreakerRegistry::allow`]).
+/// 2. Look up the connector for the candidate's backend type (a missing
+///    connector counts as a candidate-local failure, not a global one).
+/// 3. Forward; on success record `on_success` and return the stream together
+///    with the routing metadata of the winning candidate.
+/// 4. On failure record `on_failure`, sleep `retry_policy.backoff(failures)`
+///    and move on to the next candidate.
+///
+/// Returns the last forwarding error when every allowed candidate failed, or
+/// [`HierKvGatewayError::BackendUnavailable`] when every candidate was
+/// short-circuited.
+async fn forward_with_retries(
+    state: &Arc<AppState>,
+    decisions: &[RouteDecision],
+    inference: &InferenceRequest,
+    request_id: &RequestId,
+) -> std::result::Result<(BoxStream<'static, InferenceChunk>, RoutingMeta), HierKvGatewayError> {
+    let mut failures: u32 = 0;
+    let mut last_err: Option<HierKvGatewayError> = None;
+
+    for decision in decisions {
+        // 1. Circuit-breaker gate.
+        if !state.breakers.allow(&decision.backend) {
+            debug!(
+                request_id = %request_id,
+                backend = %decision.backend,
+                "skipping candidate with open circuit"
+            );
+            continue;
+        }
+
+        // Backoff between attempts: after failure #k the next attempt sleeps
+        // `backoff(k - 1)` — with the defaults (50 ms base) the first retry
+        // waits 50 ms, then 100, 200, ...
+        if failures > 0 {
+            tokio::time::sleep(state.retry_policy.backoff(failures - 1)).await;
+        }
+
+        // 2. Resolve the connector anchored to this candidate backend.
+        let Some(connector) = state.connectors.get(&decision.backend) else {
+            warn!(backend = %decision.backend, "no connector registered for this backend");
+            failures += 1;
+            last_err = Some(HierKvGatewayError::ConnectorError(format!(
+                "no connector for backend {}",
+                decision.backend
+            )));
+            continue;
         };
 
-    // 6) Build the response based on the stream field
-    if stream_mode {
-        build_sse_response(chunk_stream, &request_id, &model_name, &routing_meta)
-    } else {
-        build_non_stream_response(
-            chunk_stream,
-            &request_id,
-            &model_name,
-            &routing_meta,
-            &inference,
-        )
-        .await
+        // 3. Attempt the forward.
+        match connector.forward(&decision.backend, inference).await {
+            Ok(stream) => {
+                state.breakers.on_success(&decision.backend);
+                if failures > 0 {
+                    debug!(
+                        request_id = %request_id,
+                        backend = %decision.backend,
+                        attempt = failures + 1,
+                        "forward succeeded after retry"
+                    );
+                }
+                let routing_meta = RoutingMeta::from_decision(decision);
+                return Ok((stream, routing_meta));
+            }
+            Err(e) => {
+                state.breakers.on_failure(&decision.backend);
+                warn!(
+                    request_id = %request_id,
+                    backend = %decision.backend,
+                    attempt = failures + 1,
+                    error = %e,
+                    "forward attempt failed"
+                );
+                failures += 1;
+                last_err = Some(e);
+            }
+        }
+    }
+
+    match last_err {
+        Some(e) => Err(e),
+        None => {
+            // Every candidate was short-circuited by the breaker.
+            Err(HierKvGatewayError::BackendUnavailable)
+        }
     }
 }
 
@@ -476,7 +558,7 @@ pub async fn admin_metrics(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    let backend_id = match parse_backend_id(&id) {
+    let backend_id = match BackendId::parse(&id) {
         Some(bid) => bid,
         None => {
             return (
@@ -506,20 +588,6 @@ pub async fn admin_metrics(
         )
             .into_response(),
     }
-}
-
-/// Parse a `region/instance` formatted string into a [`BackendId`].
-///
-/// Splits only on the first `/`; the `instance` portion may contain subsequent `/`, but
-/// usually does not.
-fn parse_backend_id(s: &str) -> Option<BackendId> {
-    let slash = s.find('/')?;
-    let region = &s[..slash];
-    let instance = &s[slash + 1..];
-    if region.is_empty() || instance.is_empty() {
-        return None;
-    }
-    Some(BackendId::new(region, instance))
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +669,10 @@ pub(crate) mod test_support {
     use std::time::Duration;
 
     /// Build an AppState using the default hybrid strategy, only for unit tests.
-    pub fn build_test_app_state(self_region: &str) -> Arc<AppState> {
+    ///
+    /// Returns the bare state (not `Arc`-wrapped) so tests can adjust fields
+    /// (retry policy, breakers, connectors) before sharing it.
+    pub fn build_test_app_state(self_region: &str) -> AppState {
         let metadata = Arc::new(MetadataStore::new());
         let routing_config = RoutingConfig {
             strategy: StrategyType::Hybrid,
@@ -636,13 +707,17 @@ pub(crate) mod test_support {
             self_region.into(),
         ));
         let connectors = Arc::new(ConnectorRegistry::new());
-        Arc::new(AppState {
+        AppState {
             metadata,
             routing,
             connectors,
             routing_config,
+            breakers: Arc::new(CircuitBreakerRegistry::new(
+                &hier_kv_gateway_core::config::ResilienceConfig::default(),
+            )),
+            retry_policy: RetryPolicy::default(),
             peer_registrar: None,
-        })
+        }
     }
 }
 
@@ -651,17 +726,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_backend_id_simple() {
-        let bid = parse_backend_id("us-east-1/worker-0").unwrap();
+    fn backend_id_parse_via_core() {
+        // The admin endpoint delegates to the canonical core parser.
+        let bid = BackendId::parse("us-east-1/worker-0").unwrap();
         assert_eq!(bid.region.as_str(), "us-east-1");
         assert_eq!(bid.instance.as_str(), "worker-0");
-    }
-
-    #[test]
-    fn parse_backend_id_rejects_empty_parts() {
-        assert!(parse_backend_id("/worker-0").is_none());
-        assert!(parse_backend_id("us-east-1/").is_none());
-        assert!(parse_backend_id("us-east-1").is_none());
+        assert!(BackendId::parse("/worker-0").is_none());
+        assert!(BackendId::parse("us-east-1/").is_none());
+        assert!(BackendId::parse("us-east-1").is_none());
     }
 
     #[test]
@@ -716,5 +788,225 @@ mod tests {
         };
         let out = chunk_to_openai("rid", "m", chunk);
         assert_eq!(out.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    // ---------------------------------------------------------------------
+    // forward_with_retries: failover / circuit-breaker behavior
+    // ---------------------------------------------------------------------
+
+    mod failover {
+        use super::super::test_support::build_test_app_state;
+        use super::super::*;
+        use hier_kv_gateway_connector::connector::{BackendConnector, HealthStatus};
+        use hier_kv_gateway_core::backend::BackendType;
+        use hier_kv_gateway_core::config::ResilienceConfig;
+        use hier_kv_gateway_core::kv_event::KvCacheEvent;
+        use hier_kv_gateway_core::metrics::BackendMetrics;
+        use std::time::Duration;
+
+        /// Stub connector whose `forward` either succeeds with an immediate
+        /// `Done` stream or fails with a `ConnectorError`.
+        struct StubConnector {
+            id: BackendId,
+            succeed: bool,
+        }
+
+        impl StubConnector {
+            fn succeeding(instance: &str) -> Arc<dyn BackendConnector> {
+                Arc::new(Self {
+                    id: BackendId::new("r1", instance),
+                    succeed: true,
+                })
+            }
+
+            fn failing(instance: &str) -> Arc<dyn BackendConnector> {
+                Arc::new(Self {
+                    id: BackendId::new("r1", instance),
+                    succeed: false,
+                })
+            }
+        }
+
+        #[async_trait]
+        impl BackendConnector for StubConnector {
+            fn backend_type(&self) -> BackendType {
+                BackendType::GenericOpenAI
+            }
+
+            fn backend_id(&self) -> BackendId {
+                self.id.clone()
+            }
+
+            async fn discover(&self) -> hier_kv_gateway_core::error::Result<Vec<BackendInfo>> {
+                Ok(Vec::new())
+            }
+
+            async fn health_check(
+                &self,
+                _backend: &BackendId,
+            ) -> hier_kv_gateway_core::error::Result<HealthStatus> {
+                Ok(HealthStatus::default())
+            }
+
+            async fn forward(
+                &self,
+                backend: &BackendId,
+                _request: &InferenceRequest,
+            ) -> hier_kv_gateway_core::error::Result<BoxStream<'static, InferenceChunk>> {
+                if self.succeed {
+                    let chunk = InferenceChunk::Done {
+                        backend_id: backend.clone(),
+                        latency_ms: 0,
+                    };
+                    Ok(Box::pin(futures::stream::iter(vec![chunk])))
+                } else {
+                    Err(HierKvGatewayError::ConnectorError(format!(
+                        "stub backend {} is down",
+                        backend
+                    )))
+                }
+            }
+
+            fn supports_kv_events(&self) -> bool {
+                false
+            }
+
+            async fn subscribe_kv_events(
+                &self,
+                _backend: &BackendId,
+            ) -> hier_kv_gateway_core::error::Result<BoxStream<'static, KvCacheEvent>> {
+                Err(HierKvGatewayError::ConnectorError(
+                    "stub does not support KV events".to_string(),
+                ))
+            }
+
+            async fn collect_metrics(
+                &self,
+                _backend: &BackendId,
+            ) -> hier_kv_gateway_core::error::Result<BackendMetrics> {
+                Ok(BackendMetrics::default())
+            }
+        }
+
+        /// AppState with zero retry backoff (tests must not sleep) and a
+        /// failure-threshold-1 breaker registry, plus the given connectors.
+        fn build_state(connectors: Vec<Arc<dyn BackendConnector>>) -> Arc<AppState> {
+            let mut state = build_test_app_state("r1");
+            // Zero-delay retry policy: backoff shape is covered by the
+            // connector crate's unit tests; here we only exercise the loop.
+            state.retry_policy = RetryPolicy::new(Duration::ZERO, Duration::ZERO);
+            state.breakers = Arc::new(CircuitBreakerRegistry::new(&ResilienceConfig {
+                retry_backoff_ms: 0,
+                retry_max_backoff_ms: 0,
+                circuit_breaker_failure_threshold: 1,
+                circuit_breaker_cooldown_secs: 3600,
+                half_open_success_threshold: 1,
+            }));
+            let registry = ConnectorRegistry::new();
+            for c in connectors {
+                registry.register(c);
+            }
+            state.connectors = Arc::new(registry);
+            Arc::new(state)
+        }
+        fn decision(instance: &str) -> RouteDecision {
+            RouteDecision {
+                backend: BackendId::new("r1", instance),
+                strategy: "test".to_string(),
+                kv_overlap: 0,
+                scores: Vec::new(),
+            }
+        }
+
+        fn inference() -> InferenceRequest {
+            InferenceRequest {
+                request_id: RequestId::new("req-failover"),
+                model: "m".to_string(),
+                messages: Vec::new(),
+                token_ids: vec![1, 2, 3],
+                max_tokens: 8,
+                temperature: 0.0,
+                stream: true,
+                tools: Vec::new(),
+                lora_name: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn fails_over_to_second_candidate() {
+            let state = build_state(vec![StubConnector::failing("a"), StubConnector::succeeding("b")]);
+            let decisions = vec![decision("a"), decision("b")];
+            let req = inference();
+
+            let (stream, meta) =
+                forward_with_retries(&state, &decisions, &req, &req.request_id)
+                    .await
+                    .expect("second candidate should succeed");
+            assert_eq!(meta.backend, "r1/b");
+            // The failure on "a" opened its circuit (threshold = 1).
+            assert!(!state.breakers.allow(&BackendId::new("r1", "a")));
+            // The stream really came from the winning backend.
+            let chunks: Vec<InferenceChunk> = stream.collect().await;
+            assert!(matches!(chunks.first(), Some(InferenceChunk::Done { .. })));
+        }
+
+        #[tokio::test]
+        async fn returns_last_error_when_all_candidates_fail() {
+            let state = build_state(vec![StubConnector::failing("a"), StubConnector::failing("b")]);
+            let decisions = vec![decision("a"), decision("b")];
+            let req = inference();
+
+            let result = forward_with_retries(&state, &decisions, &req, &req.request_id).await;
+            match result {
+                Err(HierKvGatewayError::ConnectorError(msg)) => {
+                    assert!(msg.contains("r1/b"), "last error should be from b: {msg}");
+                }
+                Err(other) => panic!("expected ConnectorError, got {other:?}"),
+                Ok(_) => panic!("all candidates failing must error"),
+            }
+        }
+
+        #[tokio::test]
+        async fn open_circuit_skips_candidate() {
+            let state = build_state(vec![StubConnector::succeeding("a"), StubConnector::succeeding("b")]);
+            // Pre-open a's circuit.
+            state.breakers.on_failure(&BackendId::new("r1", "a"));
+            assert!(!state.breakers.allow(&BackendId::new("r1", "a")));
+
+            let decisions = vec![decision("a"), decision("b")];
+            let req = inference();
+            let (_stream, meta) =
+                forward_with_retries(&state, &decisions, &req, &req.request_id)
+                    .await
+                    .expect("b should serve while a is short-circuited");
+            assert_eq!(meta.backend, "r1/b");
+        }
+
+        #[tokio::test]
+        async fn all_circuits_open_returns_unavailable() {
+            let state = build_state(vec![StubConnector::succeeding("a")]);
+            state.breakers.on_failure(&BackendId::new("r1", "a"));
+
+            let decisions = vec![decision("a")];
+            let req = inference();
+            let result = forward_with_retries(&state, &decisions, &req, &req.request_id).await;
+            match result {
+                Err(e) => assert!(matches!(e, HierKvGatewayError::BackendUnavailable)),
+                Ok(_) => panic!("short-circuited candidates must yield BackendUnavailable"),
+            }
+        }
+
+        #[tokio::test]
+        async fn missing_connector_counts_as_candidate_failure() {
+            // Only "b" is registered; "a" resolves to no connector.
+            let state = build_state(vec![StubConnector::succeeding("b")]);
+            let decisions = vec![decision("a"), decision("b")];
+            let req = inference();
+            let (_stream, meta) =
+                forward_with_retries(&state, &decisions, &req, &req.request_id)
+                    .await
+                    .expect("b should serve after a resolves to nothing");
+            assert_eq!(meta.backend, "r1/b");
+        }
     }
 }

@@ -159,6 +159,30 @@ impl BackendId {
             instance: instance.into(),
         }
     }
+
+    /// Parse a `"<region>/<instance>"` string into a [`BackendId`].
+    ///
+    /// Splits on the *first* `/` only; both parts must be non-empty. This is
+    /// the canonical parser for the wire form produced by [`Display`](std::fmt::Display)
+    /// — prefer it over ad-hoc `split('/')` reimplementations.
+    pub fn parse(s: &str) -> Option<Self> {
+        let slash = s.find('/')?;
+        let region = &s[..slash];
+        let instance = &s[slash + 1..];
+        if region.is_empty() || instance.is_empty() {
+            return None;
+        }
+        Some(Self::new(region, instance))
+    }
+}
+
+impl std::str::FromStr for BackendId {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::parse(s)
+            .ok_or_else(|| format!("invalid backend id {s:?}, expected '<region>/<instance>'"))
+    }
 }
 
 impl PartialEq for BackendId {
@@ -463,5 +487,29 @@ mod tests {
         let c = WorkerWithRank::new(2, 0);
         assert!(a < b);
         assert!(b < c);
+    }
+
+    #[test]
+    fn backend_id_parse_round_trip() {
+        let id = BackendId::new("us-east-1", "worker-0");
+        let parsed = BackendId::parse(&id.to_string()).unwrap();
+        assert_eq!(id, parsed);
+        assert_eq!(parsed.region.as_str(), "us-east-1");
+        assert_eq!(parsed.instance.as_str(), "worker-0");
+        // FromStr agrees with parse
+        let via_from_str: BackendId = "us-east-1/worker-0".parse().unwrap();
+        assert_eq!(id, via_from_str);
+    }
+
+    #[test]
+    fn backend_id_parse_rejects_malformed() {
+        assert!(BackendId::parse("no-slash").is_none());
+        assert!(BackendId::parse("/empty-region").is_none());
+        assert!(BackendId::parse("empty-instance/").is_none());
+        assert!(BackendId::parse("").is_none());
+        assert!("no-slash".parse::<BackendId>().is_err());
+        // Splits on the first slash only
+        let multi = BackendId::parse("r1/a/b").unwrap();
+        assert_eq!(multi.instance.as_str(), "a/b");
     }
 }

@@ -184,7 +184,7 @@ impl MetadataGossipHandler {
             let Some(id_str) = entry.get("backend_id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let Some(backend_id) = parse_backend_id(id_str) else {
+            let Some(backend_id) = BackendId::parse(id_str) else {
                 debug!(id = %id_str, "load_state: malformed backend_id");
                 continue;
             };
@@ -296,7 +296,7 @@ impl GossipHandler for MetadataGossipHandler {
     ) {
         let mut updated = 0u64;
         for (id_str, metrics) in backends {
-            let Some(backend_id) = parse_backend_id(id_str) else {
+            let Some(backend_id) = BackendId::parse(id_str) else {
                 debug!(id = %id_str, "metrics_broadcast: malformed backend_id");
                 continue;
             };
@@ -406,21 +406,6 @@ impl GossipHandler for MetadataGossipHandler {
     }
 }
 
-/// Parse a `"region/instance"` string into a [`BackendId`].
-///
-/// Mirrors the parser in `hier-kv-gateway-api::handlers::parse_backend_id`,
-/// duplicated here to keep the cluster bridge self-contained (it must not
-/// depend on the API crate).
-fn parse_backend_id(s: &str) -> Option<BackendId> {
-    let slash = s.find('/')?;
-    let region = &s[..slash];
-    let instance = &s[slash + 1..];
-    if region.is_empty() || instance.is_empty() {
-        return None;
-    }
-    Some(BackendId::new(region, instance))
-}
-
 /// Convenience helper: convert a [`MetaKey`] to its string form without
 /// requiring the caller to import `MetaKey::as_str`.
 #[allow(dead_code)]
@@ -498,13 +483,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_id_round_trip() {
-        let b = parse_backend_id("r1/i1").unwrap();
+    fn backend_id_parse_round_trip() {
+        let b = BackendId::parse("r1/i1").unwrap();
         assert_eq!(b.region.as_str(), "r1");
         assert_eq!(b.instance.as_str(), "i1");
-        assert!(parse_backend_id("no-slash").is_none());
-        assert!(parse_backend_id("/empty-region").is_none());
-        assert!(parse_backend_id("empty-instance/").is_none());
+        assert!(BackendId::parse("no-slash").is_none());
+        assert!(BackendId::parse("/empty-region").is_none());
+        assert!(BackendId::parse("empty-instance/").is_none());
     }
 
     #[test]

@@ -34,6 +34,7 @@ use hier_kv_gateway_core::config::{load_from_file, GatewayConfig};
 use hier_kv_gateway_core::topology::{GeoCoord, RegionInfo};
 use hier_kv_gateway_metadata::store::MetadataStore;
 use hier_kv_gateway_connector::registry::ConnectorRegistry;
+use hier_kv_gateway_connector::resilience::{CircuitBreakerRegistry, RetryPolicy};
 use hier_kv_gateway_routing::engine::RoutingEngine;
 use hier_kv_gateway_routing::hybrid::HybridStrategy;
 use hier_kv_gateway_routing::kv_aware::KvAwareStrategy;
@@ -78,6 +79,7 @@ async fn main() -> Result<()> {
     let connectors = Arc::new(ConnectorRegistry::from_configs(
         &config.backends,
         &config.region.id,
+        &config.forwarding,
     ));
     discover_and_register_backends(&connectors, &metadata).await;
 
@@ -92,11 +94,18 @@ async fn main() -> Result<()> {
     let cluster_state = start_cluster(&config, metadata.clone()).await;
 
     // 7) Assemble the AppState and start the HTTP server (with graceful shutdown enabled)
+    let breakers = Arc::new(CircuitBreakerRegistry::new(&config.resilience));
+    let retry_policy = RetryPolicy::new(
+        Duration::from_millis(config.resilience.retry_backoff_ms),
+        Duration::from_millis(config.resilience.retry_max_backoff_ms),
+    );
     let app_state = AppState {
         metadata: metadata.clone(),
         routing,
         connectors,
         routing_config: config.routing.clone(),
+        breakers,
+        retry_policy,
         peer_registrar: cluster_state
             .as_ref()
             .map(|cs| cs.peer_registrar.clone()),
@@ -159,22 +168,23 @@ fn register_self_region(metadata: &MetadataStore, config: &GatewayConfig) {
 /// Invoke each registered connector's `discover()` and register the resulting
 /// BackendInfo into the MetadataStore.
 ///
+/// Backends reported by a connector beyond its own anchor (e.g. workers behind
+/// a Dynamo front-end) are additionally attached as registry aliases so the
+/// forwarding loop can address them individually.
+///
 /// Failed discoveries do not abort the startup flow; they only log a warning.
 async fn discover_and_register_backends(
     connectors: &ConnectorRegistry,
     metadata: &MetadataStore,
 ) {
-    let registered_types = connectors.registered_types();
+    let all = connectors.all();
     info!(
-        backend_types = registered_types.len(),
+        connectors = all.len(),
+        backend_types = connectors.registered_types().len(),
         "starting backend discovery"
     );
 
-    for bt in &registered_types {
-        let connector = match connectors.get(bt) {
-            Some(c) => c,
-            None => continue,
-        };
+    for connector in &all {
         match connector.discover().await {
             Ok(infos) => {
                 for info in infos {
@@ -184,11 +194,14 @@ async fn discover_and_register_backends(
                         models = ?info.models.iter().map(|m| m.model_name.as_str()).collect::<Vec<_>>(),
                         "registering backend"
                     );
+                    // Make the discovered id addressable even when it differs
+                    // from the connector's anchor id (alias is a no-op then).
+                    connectors.register_alias(info.id.clone(), connector);
                     metadata.register_backend(info);
                 }
             }
             Err(e) => {
-                warn!(backend_type = ?bt, error = %e, "backend discovery failed (skipped)");
+                warn!(backend_type = ?connector.backend_type(), error = %e, "backend discovery failed (skipped)");
             }
         }
     }
@@ -196,9 +209,21 @@ async fn discover_and_register_backends(
     info!(backends = metadata.backends_len(), "backend discovery completed");
 }
 
-/// Build the RoutingEngine from the GatewayConfig (with the default hybrid strategy
-/// embedded).
+/// Build the RoutingEngine from the GatewayConfig.
+///
+/// The hybrid strategy is always embedded (it backs `trace_sub_scores` and the
+/// degradation fallback); the configured `routing.strategy` then decides which
+/// strategy becomes the *primary* scorer:
+///
+/// - `hybrid` — the hybrid itself (default);
+/// - `round_robin` — the metadata-free rotation baseline;
+/// - `kv` / `model` / `load` / `topology` — the corresponding single
+///   sub-strategy, lifted out of the hybrid ensemble.
 fn build_routing_engine(config: &GatewayConfig) -> RoutingEngine {
+    use hier_kv_gateway_core::config::StrategyType;
+    use hier_kv_gateway_routing::round_robin::RoundRobinStrategy;
+    use hier_kv_gateway_routing::strategy::RoutingStrategy;
+
     let r = &config.routing;
     let kv = Box::new(KvAwareStrategy {
         overlap_score_credit: r.overlap_score_credit,
@@ -221,12 +246,33 @@ fn build_routing_engine(config: &GatewayConfig) -> RoutingEngine {
         r.temperature,
     );
     let session_affinity_ttl = Duration::from_secs(r.session_affinity_ttl_secs);
-    RoutingEngine::new(
+    let engine = RoutingEngine::new(
         hybrid,
         session_affinity_ttl,
         r.max_retries,
         config.region.id.clone(),
-    )
+    );
+
+    let primary: Option<Box<dyn RoutingStrategy>> = match r.strategy {
+        StrategyType::Hybrid => None,
+        StrategyType::RoundRobin => Some(Box::new(RoundRobinStrategy::new())),
+        StrategyType::Kv => Some(Box::new(KvAwareStrategy {
+            overlap_score_credit: r.overlap_score_credit,
+            prefill_load_scale: r.prefill_load_scale,
+            ckf_false_positive_penalty: 0.0,
+        })),
+        StrategyType::Model => Some(Box::new(ModelAwareStrategy::default())),
+        StrategyType::Load => Some(Box::new(LoadAwareStrategy::default())),
+        StrategyType::Topology => Some(Box::new(TopologyAwareStrategy {
+            w_rtt: 1.0,
+            w_bw: 0.0,
+            self_region: config.region.id.clone(),
+        })),
+    };
+    match primary {
+        Some(p) => engine.with_primary_strategy(p),
+        None => engine,
+    }
 }
 
 /// Owned handle to a running cluster engine, kept around so the main binary can
