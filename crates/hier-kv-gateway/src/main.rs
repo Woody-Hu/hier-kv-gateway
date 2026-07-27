@@ -25,8 +25,9 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use hier_kv_gateway_api::handlers::{AppState, PeerRegistrar};
 use hier_kv_gateway_api::server;
-use hier_kv_gateway_cluster::gossip::{GossipEngine, NoopGossipHandler};
+use hier_kv_gateway_cluster::gossip::GossipEngine;
 use hier_kv_gateway_cluster::member::MemberList;
+use hier_kv_gateway_cluster::region_view::RegionMemberView;
 use hier_kv_gateway_cluster::tcp_transport::TcpClusterTransport;
 use hier_kv_gateway_cluster::transport::ClusterTransport;
 use hier_kv_gateway_core::config::{load_from_file, GatewayConfig};
@@ -39,6 +40,8 @@ use hier_kv_gateway_routing::kv_aware::KvAwareStrategy;
 use hier_kv_gateway_routing::load_aware::LoadAwareStrategy;
 use hier_kv_gateway_routing::model_aware::ModelAwareStrategy;
 use hier_kv_gateway_routing::topology_aware::TopologyAwareStrategy;
+
+mod cluster_bridge;
 
 /// Command-line arguments.
 #[derive(Parser, Debug)]
@@ -84,10 +87,9 @@ async fn main() -> Result<()> {
     // 6) Start the cluster gossip engine (membership + Meet/Ping/Pong transport).
     //    The HTTP layer's PeerRegistrar is backed by GossipEngine::meet_peer, so the
     //    `POST /cluster/peers` endpoint only becomes functional once this step succeeds.
-    //    Metadata-broadcast handlers (KV/load/topology sync) are currently no-op —
-    //    membership convergence and peer registration work end-to-end, but
-    //    cross-instance metadata sync is left for a follow-up.
-    let cluster_state = start_cluster(&config).await;
+    //    The gossip handler bridges into MetadataStore so that metrics/topology/
+    //    CKF/session-affinity broadcasts received from peers are applied locally.
+    let cluster_state = start_cluster(&config, metadata.clone()).await;
 
     // 7) Assemble the AppState and start the HTTP server (with graceful shutdown enabled)
     let app_state = AppState {
@@ -234,6 +236,12 @@ struct ClusterState {
     engine: Arc<GossipEngine>,
     /// Backs the `POST /cluster/peers` HTTP endpoint.
     peer_registrar: Arc<dyn PeerRegistrar>,
+    /// Region-grouped view over the member list; kept so future HTTP
+    /// diagnostic endpoints (`/admin/cluster` etc.) can answer
+    /// "which foreign Regions are currently represented?" without rebuilding
+    /// the view from scratch.
+    #[allow(dead_code)]
+    region_view: RegionMemberView,
 }
 
 /// [`PeerRegistrar`] implementation backed by [`GossipEngine::meet_peer`].
@@ -265,10 +273,20 @@ impl PeerRegistrar for GossipPeerRegistrar {
 /// `bind_addr` is also used as the address advertised in `Meet` messages; if
 /// it is `0.0.0.0:port`, peers will not be able to dial back. Operators should
 /// set `cluster.bind_addr` to a reachable IP for cross-Region deployments.
-async fn start_cluster(config: &GatewayConfig) -> Option<ClusterState> {
+async fn start_cluster(
+    config: &GatewayConfig,
+    metadata: Arc<MetadataStore>,
+) -> Option<ClusterState> {
     let cluster_cfg = &config.cluster;
     let members = Arc::new(MemberList::new());
     let transport: Arc<dyn ClusterTransport> = Arc::new(TcpClusterTransport::new(members.clone()));
+
+    let handler = Arc::new(cluster_bridge::MetadataGossipHandler::new(
+        metadata,
+        members.clone(),
+    ));
+
+    let region_view = RegionMemberView::new(members.clone());
 
     let engine = Arc::new(GossipEngine::new(
         config.instance_id.clone(),
@@ -277,7 +295,7 @@ async fn start_cluster(config: &GatewayConfig) -> Option<ClusterState> {
         members,
         transport,
         cluster_cfg.clone(),
-        Arc::new(NoopGossipHandler),
+        handler,
     ));
 
     if let Err(e) = engine.start().await {
@@ -295,6 +313,7 @@ async fn start_cluster(config: &GatewayConfig) -> Option<ClusterState> {
         gossip_interval_ms = cluster_cfg.gossip_interval_ms,
         gossip_fanout = cluster_cfg.gossip_fanout,
         probe_interval_ms = cluster_cfg.probe_interval_ms,
+        local_region = %config.region.id,
         "cluster gossip engine started"
     );
 
@@ -306,6 +325,22 @@ async fn start_cluster(config: &GatewayConfig) -> Option<ClusterState> {
         }
     }
 
+    // Log the initial region-grouped membership snapshot. At startup this is
+    // typically just ourselves, but after `join_cluster` lands the seed-peers
+    // will appear here on the next gossip round.
+    let local = region_view.local_alive(&config.region.id);
+    let foreign = region_view.foreign_alive(&config.region.id);
+    info!(
+        local_alive = local.len(),
+        foreign_alive = foreign.len(),
+        foreign_regions = ?region_view
+            .foreign_regions(&config.region.id)
+            .iter()
+            .map(|r| r.as_str().to_string())
+            .collect::<Vec<_>>(),
+        "region-grouped membership snapshot"
+    );
+
     let peer_registrar: Arc<dyn PeerRegistrar> = Arc::new(GossipPeerRegistrar {
         engine: engine.clone(),
     });
@@ -313,6 +348,7 @@ async fn start_cluster(config: &GatewayConfig) -> Option<ClusterState> {
     Some(ClusterState {
         engine,
         peer_registrar,
+        region_view,
     })
 }
 

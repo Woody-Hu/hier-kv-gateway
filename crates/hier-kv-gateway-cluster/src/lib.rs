@@ -18,6 +18,7 @@ pub mod transport;
 pub mod tcp_transport;
 pub mod gossip;
 pub mod member;
+pub mod region_view;
 pub mod ckf_relay;
 pub mod messages;
 pub mod shared_state;
