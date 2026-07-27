@@ -15,3 +15,12 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 xxhash-rust = { workspace = true }
 parking_lot = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+
+[[bench]]
+name = "routing_hot_path"
+harness = false

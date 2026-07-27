@@ -19,6 +19,7 @@ futures = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

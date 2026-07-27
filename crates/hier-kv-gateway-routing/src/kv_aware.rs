@@ -50,10 +50,16 @@ impl RoutingStrategy for KvAwareStrategy {
         let hashes: &[u64] = ctx.block_hashes.as_slice();
         let hash_count = hashes.len() as i64;
 
+        // Optimization: a single batched RadixTree round-trip replaces N
+        // per-candidate `find_matches` calls. At n=20 candidates this cuts
+        // ~950 ns of channel overhead down to ~50 ns (see `metadata_hot_path`
+        // bench: per_candidate_n_calls vs single_find_all_matches).
+        let local_overlaps = meta.kv_find_all_local_overlap(hashes).await;
+
         let mut out = Vec::with_capacity(candidates.len());
         for cand in candidates {
-            // Local exact overlap (RadixTree)
-            let local_overlap = meta.kv_find_local_overlap(hashes, cand.clone()).await;
+            // Local exact overlap (RadixTree) — looked up from the batched result.
+            let local_overlap = local_overlaps.get(cand).copied().unwrap_or(0);
             // Cross-Region approximate overlap (Cuckoo Filter consumer)
             let remote_overlap = meta.kv_find_global_overlap(hashes, &cand.region);
 

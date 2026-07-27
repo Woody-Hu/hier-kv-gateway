@@ -11,11 +11,13 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use futures::stream::{BoxStream, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{debug, error, warn};
 
@@ -35,6 +37,19 @@ use crate::openai_types::{
     OpenAIChatChunk, OpenAIChatRequest, OpenAIChatResponse, OpenAIModelList,
 };
 
+/// Optional trait allowing the HTTP layer to dynamically register a new peer
+/// (typically an external-Region gateway) into the running gossip mesh.
+///
+/// Defined here (rather than in `hier-kv-gateway-cluster`) so the API crate
+/// stays decoupled from the cluster crate; the main binary wires up a concrete
+/// implementation backed by [`GossipEngine::meet_peer`].
+#[async_trait]
+pub trait PeerRegistrar: Send + Sync {
+    /// Send a `Meet` to `peer_addr` (host:port). Returns `Ok(())` on success
+    /// or an error message describing why the registration failed.
+    async fn meet_peer(&self, peer_addr: &str) -> std::result::Result<(), String>;
+}
+
 /// Application state shared by HTTP handlers.
 pub struct AppState {
     /// Metadata store (KV index, model registry, load statistics, etc.).
@@ -45,6 +60,11 @@ pub struct AppState {
     pub connectors: Arc<ConnectorRegistry>,
     /// Routing configuration (provides parameters such as kv_block_size).
     pub routing_config: RoutingConfig,
+    /// Optional peer registrar (backed by `GossipEngine` when cluster mode is enabled).
+    ///
+    /// When `None`, the `POST /cluster/peers` endpoint returns `503 Service Unavailable`,
+    /// indicating the gateway was started without a cluster transport.
+    pub peer_registrar: Option<Arc<dyn PeerRegistrar>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -52,6 +72,7 @@ impl std::fmt::Debug for AppState {
         f.debug_struct("AppState")
             .field("backends", &self.metadata.backends_len())
             .field("routing_strategy", &self.routing_config.strategy)
+            .field("cluster_enabled", &self.peer_registrar.is_some())
             .finish()
     }
 }
@@ -501,6 +522,69 @@ fn parse_backend_id(s: &str) -> Option<BackendId> {
     Some(BackendId::new(region, instance))
 }
 
+// ---------------------------------------------------------------------------
+// Cluster peer management
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /cluster/peers`.
+///
+/// Used to dynamically register an external-Region gateway into the running
+/// gossip mesh after startup. The local gateway sends a `Meet` message to
+/// `peer_addr`; the remote gateway replies with a `Pong`, and the standard
+/// gossip loop then propagates the new member to the rest of the cluster.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClusterPeersRequest {
+    /// Address of the peer gateway to register, in `host:port` form (matching
+    /// the cluster transport's bind address).
+    pub peer_addr: String,
+}
+
+/// Response body for `POST /cluster/peers`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClusterPeersResponse {
+    /// Whether the Meet message was sent successfully.
+    pub ok: bool,
+    /// Human-readable status / error message.
+    pub message: String,
+}
+
+/// `POST /cluster/peers` — dynamically register an external-Region gateway.
+///
+/// Returns:
+/// - `200 OK` with `ok: true` when the Meet was sent successfully.
+/// - `200 OK` with `ok: false` and an error message when the transport
+///   rejected the send (e.g. peer unreachable).
+/// - `503 Service Unavailable` when the gateway was started without a cluster
+///   transport (no `PeerRegistrar` wired up).
+pub async fn cluster_peers(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ClusterPeersRequest>,
+) -> Response {
+    let Some(registrar) = state.peer_registrar.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ClusterPeersResponse {
+                ok: false,
+                message: "cluster transport is not enabled on this gateway".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    match registrar.meet_peer(&req.peer_addr).await {
+        Ok(()) => Json(ClusterPeersResponse {
+            ok: true,
+            message: format!("Meet sent to {}", req.peer_addr),
+        })
+        .into_response(),
+        Err(e) => Json(ClusterPeersResponse {
+            ok: false,
+            message: format!("Failed to send Meet to {}: {}", req.peer_addr, e),
+        })
+        .into_response(),
+    }
+}
+
 /// Used to construct a minimal AppState in tests.
 ///
 /// Only compiled under `cfg(test)`, to avoid exposing unnecessary dependencies in
@@ -557,6 +641,7 @@ pub(crate) mod test_support {
             routing,
             connectors,
             routing_config,
+            peer_registrar: None,
         })
     }
 }

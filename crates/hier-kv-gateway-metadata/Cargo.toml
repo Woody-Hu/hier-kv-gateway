@@ -18,3 +18,10 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "metadata_hot_path"
+harness = false

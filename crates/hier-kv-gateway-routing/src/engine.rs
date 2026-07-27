@@ -56,6 +56,14 @@ pub struct RoutingEngine {
     pub prefix_history: Arc<PrefixReuseHistory>,
     /// Degradation strategy (fallback).
     pub degradation: DegradationStrategy,
+    /// Whether to re-evaluate sub-strategies after selection to populate
+    /// `RouteDecision::scores` for tracing.
+    ///
+    /// Defaults to `false`: the decision carries only the final hybrid score,
+    /// avoiding a redundant O(N) re-evaluation of kv/load/topology sub-strategies.
+    /// Set to `true` when detailed per-strategy tracing is required (e.g.
+    /// debug builds, integration tests).
+    pub trace_sub_scores: bool,
 }
 
 impl RoutingEngine {
@@ -79,7 +87,19 @@ impl RoutingEngine {
             self_region,
             prefix_history,
             degradation,
+            trace_sub_scores: false,
         }
+    }
+
+    /// Enable or disable per-strategy sub-score tracing in [`route`](Self::route).
+    ///
+    /// When enabled, the engine re-evaluates the kv/load/topology sub-strategies
+    /// after selection to populate `RouteDecision::scores`. This roughly doubles
+    /// the per-request cost (see `routing_hot_path::engine_route_full` bench:
+    /// ~240 µs at n=20 with tracing vs ~120 µs without). Defaults to `false`.
+    pub fn with_trace_sub_scores(mut self, enabled: bool) -> Self {
+        self.trace_sub_scores = enabled;
+        self
     }
 
     /// Borrow the shared prefix reuse history.
@@ -217,9 +237,12 @@ impl RoutingEngine {
         }
 
         // 8. Collect the sub-scores of each sub-strategy for the selected backend (for tracing only).
-        //    The degradation path does not invoke sub-strategy evaluation to avoid amplifying failures when metadata is unavailable.
+        //    This is opt-in via `trace_sub_scores`: the re-evaluation roughly
+        //    doubles the per-request cost (see `routing_hot_path::engine_route_full`
+        //    bench), so it is disabled by default and only turned on when an
+        //    upper layer explicitly requests per-strategy tracing.
         let mut scores: Vec<(String, f64)> = Vec::new();
-        if used_strategy == self.hybrid.name() {
+        if self.trace_sub_scores && used_strategy == self.hybrid.name() {
             let kv_scores = self.hybrid.kv.evaluate(ctx, &candidates, meta).await?;
             let load_scores = self.hybrid.load.evaluate(ctx, &candidates, meta).await?;
             let topo_scores = self

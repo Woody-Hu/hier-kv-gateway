@@ -14,7 +14,9 @@ use tracing::{info, warn};
 
 use hier_kv_gateway_core::error::{HierKvGatewayError, Result as HierKvGatewayResult};
 
-use crate::handlers::{admin_backends, admin_metrics, chat_completions, health, list_models, AppState};
+use crate::handlers::{
+    admin_backends, admin_metrics, chat_completions, cluster_peers, health, list_models, AppState,
+};
 
 /// Path constants, kept consistent with the documentation.
 mod routes {
@@ -29,6 +31,8 @@ mod routes {
     /// Admin endpoint: metrics for a single backend.
     /// axum 0.8 uses the `{id}` placeholder syntax.
     pub const ADMIN_BACKEND_METRICS: &str = "/admin/backends/{id}/metrics";
+    /// Cluster endpoint: dynamically register a peer gateway.
+    pub const CLUSTER_PEERS: &str = "/cluster/peers";
 }
 
 /// Create an axum [`Router`] with all routes mounted.
@@ -39,6 +43,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(routes::HEALTH, get(health))
         .route(routes::ADMIN_BACKENDS, get(admin_backends))
         .route(routes::ADMIN_BACKEND_METRICS, get(admin_metrics))
+        .route(routes::CLUSTER_PEERS, post(cluster_peers))
         .with_state(state)
 }
 
@@ -184,5 +189,40 @@ mod tests {
         // The path contains two `/`; axum's {id} only matches the whole segment before
         // the last one. Expect 404 here because route matching fails.
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cluster_peers_returns_503_when_no_registrar() {
+        // build_test_app_state wires up AppState with `peer_registrar: None`,
+        // simulating a gateway started without a cluster transport.
+        let state = build_test_app_state("test-region");
+        let app = create_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/peers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "peer_addr": "10.0.0.2:7946"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("cluster transport is not enabled"),
+            "expected cluster-disabled message, got: {v}"
+        );
     }
 }

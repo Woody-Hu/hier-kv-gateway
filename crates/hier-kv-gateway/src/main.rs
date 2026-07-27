@@ -1,8 +1,8 @@
 //! Hier KV Gateway main binary entry point.
 //!
 //! This binary loads a TOML config file, initializes tracing, MetadataStore,
-//! ConnectorRegistry, RoutingEngine, and the HTTP API server, and supports graceful
-//! shutdown on Ctrl-C.
+//! ConnectorRegistry, RoutingEngine, the cluster gossip engine, and the HTTP API
+//! server, and supports graceful shutdown on Ctrl-C.
 //!
 //! Typical usage:
 //! ```bash
@@ -10,18 +10,25 @@
 //! ```
 //!
 //! After startup, it listens on the address specified by `[listen]` in the config and
-//! serves an OpenAI-compatible HTTP API.
+//! serves an OpenAI-compatible HTTP API. The `[cluster]` section additionally binds a
+//! TCP transport for SWIM/gossip membership management; the `POST /cluster/peers`
+//! endpoint can be used to dynamically attach external-Region gateways after startup.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use clap::Parser;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use hier_kv_gateway_api::handlers::AppState;
+use hier_kv_gateway_api::handlers::{AppState, PeerRegistrar};
 use hier_kv_gateway_api::server;
+use hier_kv_gateway_cluster::gossip::{GossipEngine, NoopGossipHandler};
+use hier_kv_gateway_cluster::member::MemberList;
+use hier_kv_gateway_cluster::tcp_transport::TcpClusterTransport;
+use hier_kv_gateway_cluster::transport::ClusterTransport;
 use hier_kv_gateway_core::config::{load_from_file, GatewayConfig};
 use hier_kv_gateway_core::topology::{GeoCoord, RegionInfo};
 use hier_kv_gateway_metadata::store::MetadataStore;
@@ -74,12 +81,23 @@ async fn main() -> Result<()> {
     // 5) Create the RoutingEngine (hybrid strategy + config parameters)
     let routing = Arc::new(build_routing_engine(&config));
 
-    // 6) Assemble the AppState and start the HTTP server (with graceful shutdown enabled)
+    // 6) Start the cluster gossip engine (membership + Meet/Ping/Pong transport).
+    //    The HTTP layer's PeerRegistrar is backed by GossipEngine::meet_peer, so the
+    //    `POST /cluster/peers` endpoint only becomes functional once this step succeeds.
+    //    Metadata-broadcast handlers (KV/load/topology sync) are currently no-op —
+    //    membership convergence and peer registration work end-to-end, but
+    //    cross-instance metadata sync is left for a follow-up.
+    let cluster_state = start_cluster(&config).await;
+
+    // 7) Assemble the AppState and start the HTTP server (with graceful shutdown enabled)
     let app_state = AppState {
         metadata: metadata.clone(),
         routing,
         connectors,
         routing_config: config.routing.clone(),
+        peer_registrar: cluster_state
+            .as_ref()
+            .map(|cs| cs.peer_registrar.clone()),
     };
 
     let listen_addr = format!("{}:{}", config.listen.addr, config.listen.port);
@@ -87,7 +105,19 @@ async fn main() -> Result<()> {
 
     if let Err(e) = server::serve_with_graceful_shutdown(&listen_addr, app_state).await {
         error!(error = %e, "HTTP server exited abnormally");
+        // Still try to stop the cluster engine so the gossip transport does not leak.
+        if let Some(cs) = cluster_state.as_ref() {
+            let _ = cs.engine.stop().await;
+        }
         return Err(anyhow::anyhow!("HTTP server exited: {}", e));
+    }
+
+    // 8) Graceful shutdown: stop the cluster engine after the HTTP server has exited.
+    if let Some(cs) = cluster_state.as_ref() {
+        info!("stopping cluster gossip engine");
+        if let Err(e) = cs.engine.stop().await {
+            warn!(error = %e, "cluster engine stop returned an error");
+        }
     }
 
     info!("Hier KV Gateway has stopped");
@@ -197,6 +227,95 @@ fn build_routing_engine(config: &GatewayConfig) -> RoutingEngine {
     )
 }
 
+/// Owned handle to a running cluster engine, kept around so the main binary can
+/// stop it cleanly on shutdown.
+struct ClusterState {
+    /// The gossip engine itself; shared with the `PeerRegistrar` impl.
+    engine: Arc<GossipEngine>,
+    /// Backs the `POST /cluster/peers` HTTP endpoint.
+    peer_registrar: Arc<dyn PeerRegistrar>,
+}
+
+/// [`PeerRegistrar`] implementation backed by [`GossipEngine::meet_peer`].
+///
+/// Each `POST /cluster/peers` call results in a single `Meet` message being sent
+/// to the requested peer address; the standard gossip loop then propagates the
+/// new member to the rest of the cluster.
+struct GossipPeerRegistrar {
+    engine: Arc<GossipEngine>,
+}
+
+#[async_trait]
+impl PeerRegistrar for GossipPeerRegistrar {
+    async fn meet_peer(&self, peer_addr: &str) -> std::result::Result<(), String> {
+        self.engine
+            .meet_peer(peer_addr)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Bring up the cluster gossip engine: bind the TCP transport, start the gossip
+/// / probe / message loops, and send `Meet` to every configured seed peer.
+///
+/// Returns `None` (and logs a warning) when the transport fails to bind — the
+/// HTTP server can still serve requests in single-node mode, but the
+/// `POST /cluster/peers` endpoint will return 503.
+///
+/// `bind_addr` is also used as the address advertised in `Meet` messages; if
+/// it is `0.0.0.0:port`, peers will not be able to dial back. Operators should
+/// set `cluster.bind_addr` to a reachable IP for cross-Region deployments.
+async fn start_cluster(config: &GatewayConfig) -> Option<ClusterState> {
+    let cluster_cfg = &config.cluster;
+    let members = Arc::new(MemberList::new());
+    let transport: Arc<dyn ClusterTransport> = Arc::new(TcpClusterTransport::new(members.clone()));
+
+    let engine = Arc::new(GossipEngine::new(
+        config.instance_id.clone(),
+        config.region.id.clone(),
+        cluster_cfg.bind_addr.clone(),
+        members,
+        transport,
+        cluster_cfg.clone(),
+        Arc::new(NoopGossipHandler),
+    ));
+
+    if let Err(e) = engine.start().await {
+        warn!(
+            bind_addr = %cluster_cfg.bind_addr,
+            error = %e,
+            "cluster engine failed to start; running in single-node mode (POST /cluster/peers will return 503)"
+        );
+        return None;
+    }
+
+    info!(
+        bind_addr = %cluster_cfg.bind_addr,
+        seeds = cluster_cfg.seed_peers.len(),
+        gossip_interval_ms = cluster_cfg.gossip_interval_ms,
+        gossip_fanout = cluster_cfg.gossip_fanout,
+        probe_interval_ms = cluster_cfg.probe_interval_ms,
+        "cluster gossip engine started"
+    );
+
+    // Best-effort join: send Meet to each seed peer. Failures are logged but
+    // do not abort startup — the gossip loop will retry via subsequent Pings.
+    if !cluster_cfg.seed_peers.is_empty() {
+        if let Err(e) = engine.join_cluster(&cluster_cfg.seed_peers).await {
+            warn!(error = %e, "join_cluster encountered an error (continuing)");
+        }
+    }
+
+    let peer_registrar: Arc<dyn PeerRegistrar> = Arc::new(GossipPeerRegistrar {
+        engine: engine.clone(),
+    });
+
+    Some(ClusterState {
+        engine,
+        peer_registrar,
+    })
+}
+
 /// Print the startup banner, including instance identity, listen address, Region, and
 /// routing strategy, and other key information.
 fn print_startup_banner(config: &GatewayConfig) {
@@ -227,6 +346,11 @@ fn print_startup_banner(config: &GatewayConfig) {
     info!(
         bind_addr = %config.cluster.bind_addr,
         seeds = config.cluster.seed_peers.len(),
+        gossip_interval_ms = config.cluster.gossip_interval_ms,
+        gossip_fanout = config.cluster.gossip_fanout,
+        probe_interval_ms = config.cluster.probe_interval_ms,
+        probe_timeout_ms = config.cluster.probe_timeout_ms,
+        suspect_timeout_secs = config.cluster.suspect_timeout_secs,
         "cluster configuration"
     );
     info!("======================================");

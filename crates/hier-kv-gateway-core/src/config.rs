@@ -124,6 +124,30 @@ pub struct ClusterConfig {
     pub probe_timeout_ms: u64,
     /// Suspect state timeout (seconds).
     pub suspect_timeout_secs: u64,
+    /// Gossip fanout: number of alive members pinged per gossip round.
+    ///
+    /// Defaults to `3` (the SWIM paper's recommended value). Larger values
+    /// spread membership/metadata changes faster at the cost of more
+    /// per-round network traffic. Tunable at deploy time to trade off
+    /// convergence speed vs bandwidth on slow edge links.
+    #[serde(default = "default_gossip_fanout")]
+    pub gossip_fanout: usize,
+    /// Probe loop interval (milliseconds).
+    ///
+    /// Controls how often the probe loop scans the member list for
+    /// `Alive → Suspect` and `Suspect → Dead` transitions. Independent of
+    /// `gossip_interval_ms` to avoid coupling detection cadence to
+    /// heartbeat cadence. Defaults to `500` ms.
+    #[serde(default = "default_probe_interval_ms")]
+    pub probe_interval_ms: u64,
+}
+
+fn default_gossip_fanout() -> usize {
+    3
+}
+
+fn default_probe_interval_ms() -> u64 {
+    500
 }
 
 /// Backend connection configuration (without runtime state).

@@ -89,6 +89,20 @@ impl MetadataStore {
         self.kv_index.kv_find_local_overlap(hashes, backend).await
     }
 
+    /// Local exact query (batched): returns the prefix overlap length of *all*
+    /// backends in a single round-trip to the RadixTree worker thread.
+    ///
+    /// This is the batched counterpart of [`kv_find_local_overlap`] and is the
+    /// preferred entry point when scoring multiple candidate backends per
+    /// request (e.g. inside `KvAwareStrategy::evaluate`). See
+    /// `metadata_hot_path` bench for the speedup characterization.
+    pub async fn kv_find_all_local_overlap(
+        &self,
+        hashes: &[u64],
+    ) -> HashMap<BackendId, u32> {
+        self.kv_index.kv_find_all_local_overlap(hashes).await
+    }
+
     /// Cross-Region approximate query for a Region's prefix overlap on a hash sequence.
     pub fn kv_find_global_overlap(&self, hashes: &[u64], region: &RegionId) -> u32 {
         self.kv_index.kv_find_global_overlap(hashes, region)

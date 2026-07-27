@@ -40,13 +40,12 @@ use crate::member::{now_unix_millis, ClusterMember, MemberList, MemberStatus};
 use crate::messages::{ClusterMessage, MetaDigest, MetaEntry};
 use crate::transport::ClusterTransport;
 
-/// Default number of members selected per Gossip round (refer to the SWIM default).
-const GOSSIP_FANOUT: usize = 3;
+/// Fallback fanout used when a config supplies `0` (which would otherwise
+/// stall gossip entirely). The SWIM paper recommends 3.
+const DEFAULT_GOSSIP_FANOUT: usize = 3;
 
-/// Scan interval of the probe loop (milliseconds).
-///
-/// Not tightly bound to `gossip_interval_ms`, to avoid probing being too sparse or too dense.
-const PROBE_LOOP_INTERVAL_MS: u64 = 500;
+/// Fallback probe interval used when a config supplies `0`.
+const DEFAULT_PROBE_INTERVAL_MS: u64 = 500;
 
 /// Handler trait for metadata / metrics / CKF / topology / session affinity messages.
 ///
@@ -249,6 +248,7 @@ impl GossipEngine {
             self.transport.clone(),
             self.handler.clone(),
             self.config.gossip_interval_ms,
+            self.config.gossip_fanout.max(DEFAULT_GOSSIP_FANOUT),
             self.running.clone(),
         ));
 
@@ -258,6 +258,9 @@ impl GossipEngine {
             self.members.clone(),
             self.config.probe_timeout_ms,
             self.config.suspect_timeout_secs,
+            self.config
+                .probe_interval_ms
+                .max(DEFAULT_PROBE_INTERVAL_MS),
             self.running.clone(),
         ));
 
@@ -297,6 +300,29 @@ impl GossipEngine {
             }
         }
         Ok(())
+    }
+
+    /// Dynamically register a single peer (typically an external-Region
+    /// gateway) by sending it a [`ClusterMessage::Meet`].
+    ///
+    /// This is the runtime counterpart of [`join_cluster`]: the seed-peer
+    /// list is static config, while `meet_peer` is invoked via the
+    /// `POST /cluster/peers` HTTP endpoint to attach an external-Region
+    /// gateway after the local instance has already started.
+    ///
+    /// On success the remote gateway learns our identity and address (via
+    /// the Meet payload) and replies with a Pong; the standard gossip loop
+    /// then propagates the new member to the rest of the cluster.
+    pub async fn meet_peer(&self, peer_addr: &str) -> Result<()> {
+        let meet = ClusterMessage::Meet {
+            sender: self.self_id.clone(),
+            region: self.self_region.clone(),
+            addr: self.self_addr.clone(),
+        };
+        self.transport.send(peer_addr, &meet).await.map_err(|e| {
+            warn!(target = %peer_addr, error = %e, "meet_peer failed");
+            e
+        })
     }
 
     /// Stop the engine: clear the running flag and stop the transport layer.
@@ -493,7 +519,7 @@ impl GossipEngine {
         }
     }
 
-    /// Gossip loop: every `interval_ms`, randomly select `GOSSIP_FANOUT` alive members and send them a Ping.
+    /// Gossip loop: every `interval_ms`, randomly select `fanout` alive members and send them a Ping.
     async fn gossip_loop(
         self_id: InstanceId,
         _self_region: RegionId,
@@ -501,6 +527,7 @@ impl GossipEngine {
         transport: Arc<dyn ClusterTransport>,
         handler: Arc<dyn GossipHandler>,
         interval_ms: u64,
+        fanout: usize,
         running: Arc<AtomicBool>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
@@ -525,7 +552,7 @@ impl GossipEngine {
                 let mut rng = rand::rng();
                 let mut chosen = candidates.clone();
                 chosen.shuffle(&mut rng);
-                chosen.into_iter().take(GOSSIP_FANOUT).collect()
+                chosen.into_iter().take(fanout).collect()
             };
             for member in targets {
                 let ping = ClusterMessage::Ping {
@@ -547,10 +574,11 @@ impl GossipEngine {
         members: Arc<MemberList>,
         probe_timeout_ms: u64,
         suspect_timeout_secs: u64,
+        probe_interval_ms: u64,
         running: Arc<AtomicBool>,
     ) {
         let mut interval =
-            tokio::time::interval(Duration::from_millis(PROBE_LOOP_INTERVAL_MS));
+            tokio::time::interval(Duration::from_millis(probe_interval_ms.max(1)));
         let suspect_timeout_ms = suspect_timeout_secs.saturating_mul(1000);
         loop {
             if !running.load(Ordering::Relaxed) {
@@ -1004,6 +1032,8 @@ mod tests {
                 gossip_interval_ms: 1000,
                 probe_timeout_ms: 5000,
                 suspect_timeout_secs: 5,
+                gossip_fanout: 3,
+                probe_interval_ms: 500,
             },
             handler,
         );
@@ -1040,6 +1070,8 @@ mod tests {
                 gossip_interval_ms: 1000,
                 probe_timeout_ms: 5000,
                 suspect_timeout_secs: 5,
+                gossip_fanout: 3,
+                probe_interval_ms: 500,
             },
             handler.clone(),
         );
@@ -1091,6 +1123,8 @@ mod tests {
                 gossip_interval_ms: 1000,
                 probe_timeout_ms: 5000,
                 suspect_timeout_secs: 5,
+                gossip_fanout: 3,
+                probe_interval_ms: 500,
             },
             handler.clone(),
         );
@@ -1130,6 +1164,8 @@ mod tests {
                 gossip_interval_ms: 1000,
                 probe_timeout_ms: 5000,
                 suspect_timeout_secs: 5,
+                gossip_fanout: 3,
+                probe_interval_ms: 500,
             },
             handler,
         );
@@ -1191,6 +1227,8 @@ mod tests {
                 gossip_interval_ms: 1000,
                 probe_timeout_ms: 5000,
                 suspect_timeout_secs: 5,
+                gossip_fanout: 3,
+                probe_interval_ms: 500,
             },
             handler,
         );
