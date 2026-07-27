@@ -19,13 +19,26 @@ use async_trait::async_trait;
 
 /// Backend connector abstraction.
 ///
-/// A `BackendConnector` typically corresponds to an access entry for a class of
-/// ([`BackendType`]) backend instances. Objects implementing this trait are registered to
+/// A `BackendConnector` instance is anchored to exactly one backend endpoint:
+/// [`backend_id`](BackendConnector::backend_id) identifies that endpoint, and
+/// [`forward`](BackendConnector::forward) sends traffic to it. `discover()` may
+/// additionally report *further* backends reachable through the same connector
+/// (e.g. a Dynamo cluster front-end); the registry records those as aliases so
+/// the routing layer can address them individually.
+///
+/// Objects implementing this trait are registered to
 /// [`crate::registry::ConnectorRegistry`] as `Arc<dyn BackendConnector>`.
 #[async_trait]
 pub trait BackendConnector: Send + Sync {
     /// Returns the backend type proxied by this connector.
     fn backend_type(&self) -> BackendType;
+
+    /// The identifier of the backend endpoint this connector is anchored to.
+    ///
+    /// Used by [`crate::registry::ConnectorRegistry`] as the registration key,
+    /// so that forwarding can be addressed per backend instance rather than
+    /// per backend type.
+    fn backend_id(&self) -> BackendId;
 
     /// Discover the list of backend instances managed by this connector.
     ///

@@ -42,6 +42,10 @@ pub struct OpenAICompatConnector {
     models: Vec<String>,
     /// KV block size (used to construct BackendInfo).
     kv_block_size: u32,
+    /// When `true`, requests carrying `token_ids` are forwarded as
+    /// `prompt_token_ids` instead of text `messages` (see
+    /// [`ForwardingConfig::emit_token_ids`](hier_kv_gateway_core::config::ForwardingConfig)).
+    emit_token_ids: bool,
 }
 
 impl OpenAICompatConnector {
@@ -65,7 +69,18 @@ impl OpenAICompatConnector {
             instance_id: instance_id.into(),
             models,
             kv_block_size,
+            emit_token_ids: false,
         }
+    }
+
+    /// Enable or disable token-id forwarding (builder style).
+    ///
+    /// When enabled, [`InferenceRequest`]s that carry a non-empty `token_ids`
+    /// sequence are forwarded as `prompt_token_ids` (vLLM/Dynamo extension)
+    /// instead of re-serialized text `messages`.
+    pub fn with_emit_token_ids(mut self, emit: bool) -> Self {
+        self.emit_token_ids = emit;
+        self
     }
 
     /// Construct a connector from an endpoint URL and configuration.
@@ -85,11 +100,6 @@ impl OpenAICompatConnector {
             models,
             kv_block_size,
         )
-    }
-
-    /// Construct the BackendId for this connector.
-    fn backend_id(&self) -> BackendId {
-        BackendId::new(self.region.clone(), self.instance_id.clone())
     }
 
     /// Health check URL.
@@ -112,6 +122,10 @@ impl OpenAICompatConnector {
 impl BackendConnector for OpenAICompatConnector {
     fn backend_type(&self) -> BackendType {
         self.backend_type.clone()
+    }
+
+    fn backend_id(&self) -> BackendId {
+        BackendId::new(self.region.clone(), self.instance_id.clone())
     }
 
     async fn discover(&self) -> Result<Vec<BackendInfo>> {
@@ -197,10 +211,9 @@ impl BackendConnector for OpenAICompatConnector {
         let start = Instant::now();
         let backend_id = backend.clone();
 
-        // Build the OpenAI Chat Completions request body
-        let body = ChatCompletionRequest::from(request);
-        let body_json = serde_json::to_value(&body)
-            .map_err(|e| HierKvGatewayError::ConnectorError(format!("request serialization failed: {}", e)))?;
+        // Build the request body: token-id form when configured and the
+        // request carries pre-tokenized ids, otherwise the text chat form.
+        let body_json = build_request_body(request, self.emit_token_ids)?;
 
         let resp = self
             .client
@@ -286,12 +299,22 @@ impl VllmConnector {
             kv_block_size,
         ))
     }
+
+    /// Enable or disable token-id forwarding (builder style), mirroring
+    /// [`OpenAICompatConnector::with_emit_token_ids`].
+    pub fn with_emit_token_ids(mut self, emit: bool) -> Self {
+        self.0 = self.0.with_emit_token_ids(emit);
+        self
+    }
 }
 
 #[async_trait]
 impl BackendConnector for VllmConnector {
     fn backend_type(&self) -> BackendType {
         self.0.backend_type()
+    }
+    fn backend_id(&self) -> BackendId {
+        self.0.backend_id()
     }
     async fn discover(&self) -> Result<Vec<BackendInfo>> {
         self.0.discover().await
@@ -323,6 +346,53 @@ impl BackendConnector for VllmConnector {
 }
 
 // ===== OpenAI API request/response structures =====
+
+/// Build the JSON body for a downstream forward call.
+///
+/// Two wire forms:
+///
+/// * **Text form** (default): OpenAI Chat Completions with `messages`.
+/// * **Token-id form**: when `emit_token_ids` is set *and* the request carries
+///   a non-empty `token_ids` sequence, the body instead carries
+///   `prompt_token_ids` — the vLLM/Dynamo extension that lets the backend skip
+///   re-tokenization and guarantees the KV block hashes the gateway routed on
+///   match the backend's actual prefill blocks. Requests without `token_ids`
+///   keep the text form regardless of `emit_token_ids`.
+fn build_request_body(req: &InferenceRequest, emit_token_ids: bool) -> Result<serde_json::Value> {
+    if emit_token_ids && !req.token_ids.is_empty() {
+        let body = TokenIdCompletionRequest::from(req);
+        serde_json::to_value(&body)
+    } else {
+        let body = ChatCompletionRequest::from(req);
+        serde_json::to_value(&body)
+    }
+    .map_err(|e| HierKvGatewayError::ConnectorError(format!("request serialization failed: {}", e)))
+}
+
+/// Token-id request body (vLLM/Dynamo `prompt_token_ids` extension).
+///
+/// Carries the pre-tokenized prompt instead of `messages`; mutually exclusive
+/// with the text form at the gateway level.
+#[derive(Serialize)]
+struct TokenIdCompletionRequest {
+    model: String,
+    prompt_token_ids: Vec<u32>,
+    max_tokens: u32,
+    temperature: f64,
+    stream: bool,
+}
+
+impl From<&InferenceRequest> for TokenIdCompletionRequest {
+    fn from(req: &InferenceRequest) -> Self {
+        Self {
+            model: req.model.clone(),
+            prompt_token_ids: req.token_ids.clone(),
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+            stream: true, // Always use streaming
+        }
+    }
+}
 
 /// OpenAI Chat Completions request body.
 #[derive(Serialize)]
@@ -744,6 +814,49 @@ vllm:gpu_cache_usage_perc 0.5
         assert_eq!(json["model"], "test-model");
         assert_eq!(json["stream"], true);
         assert_eq!(json["max_tokens"], 100);
+    }
+
+    /// Helper: build an InferenceRequest carrying both text and token ids.
+    fn tokenized_request() -> InferenceRequest {
+        InferenceRequest {
+            request_id: RequestId::new("r1"),
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            token_ids: vec![101, 102, 103],
+            max_tokens: 32,
+            temperature: 0.5,
+            stream: true,
+            tools: vec![],
+            lora_name: None,
+        }
+    }
+
+    #[test]
+    fn body_uses_token_ids_when_enabled() {
+        let json = build_request_body(&tokenized_request(), true).unwrap();
+        assert_eq!(json["prompt_token_ids"], serde_json::json!([101, 102, 103]));
+        assert!(json.get("messages").is_none());
+        assert_eq!(json["model"], "test-model");
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["max_tokens"], 32);
+    }
+
+    #[test]
+    fn body_falls_back_to_text_when_disabled_or_empty() {
+        // Disabled: text form even though token ids are present.
+        let json = build_request_body(&tokenized_request(), false).unwrap();
+        assert!(json.get("prompt_token_ids").is_none());
+        assert!(json["messages"].is_array());
+
+        // Enabled but no token ids on the request: still text form.
+        let mut req = tokenized_request();
+        req.token_ids.clear();
+        let json = build_request_body(&req, true).unwrap();
+        assert!(json.get("prompt_token_ids").is_none());
+        assert!(json["messages"].is_array());
     }
 
     use hier_kv_gateway_core::ids::RequestId;

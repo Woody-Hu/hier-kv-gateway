@@ -25,6 +25,12 @@ pub struct GatewayConfig {
     pub routing: RoutingConfig,
     /// Cluster membership protocol configuration.
     pub cluster: ClusterConfig,
+    /// Downstream (gateway → backend) forwarding behavior.
+    #[serde(default)]
+    pub forwarding: ForwardingConfig,
+    /// Retry / circuit-breaker resilience behavior for backend forwarding.
+    #[serde(default)]
+    pub resilience: ResilienceConfig,
     /// Configured backend list; empty by default.
     #[serde(default)]
     pub backends: Vec<BackendConfig>,
@@ -75,6 +81,12 @@ pub enum StrategyType {
     Load,
     /// Route by topology distance only.
     Topology,
+    /// Round-robin baseline: rotate through candidates in order.
+    ///
+    /// The routing engine always keeps a round-robin terminal fallback so a
+    /// decision is still produced when every metadata-driven strategy fails;
+    /// selecting this variant makes round-robin the *primary* mechanism.
+    RoundRobin,
 }
 
 /// Routing strategy weights.
@@ -150,6 +162,73 @@ fn default_probe_interval_ms() -> u64 {
     500
 }
 
+/// Downstream forwarding behavior (gateway → backend).
+///
+/// All fields carry defaults so existing configurations keep working unchanged
+/// (`emit_token_ids = false` preserves the historical text-based forwarding).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ForwardingConfig {
+    /// When `true` and the incoming request carries a pre-tokenized
+    /// `token_ids` sequence, the gateway forwards `prompt_token_ids` to the
+    /// backend *instead of* re-serializing the chat `messages` text.
+    ///
+    /// This matches the disaggregated-serving pattern (vLLM / Dynamo accept
+    /// `prompt_token_ids`): the gateway tokenizes (or receives tokens) once,
+    /// computes KV block hashes from the same sequence used for routing, and
+    /// the backend skips re-tokenization. Requests without `token_ids` fall
+    /// back to the normal text path regardless of this flag.
+    pub emit_token_ids: bool,
+}
+
+impl Default for ForwardingConfig {
+    fn default() -> Self {
+        Self {
+            emit_token_ids: false,
+        }
+    }
+}
+
+/// Retry / circuit-breaker configuration for backend forwarding.
+///
+/// The retry count itself is governed by [`RoutingConfig::max_retries`]; this
+/// section tunes the backoff shape and the per-backend circuit breaker that
+/// short-circuits candidates with a recent failure streak.
+///
+/// All fields carry defaults so existing configurations keep working
+/// unchanged.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResilienceConfig {
+    /// Base backoff between two forward attempts (milliseconds). The effective
+    /// delay doubles per attempt: `base * 2^attempt`, capped by
+    /// `retry_max_backoff_ms`.
+    pub retry_backoff_ms: u64,
+    /// Upper bound for the retry backoff (milliseconds).
+    pub retry_max_backoff_ms: u64,
+    /// Consecutive forward failures after which a backend's circuit opens and
+    /// it is skipped by the forwarding loop.
+    pub circuit_breaker_failure_threshold: u32,
+    /// How long (seconds) an open circuit waits before allowing a half-open
+    /// probe through.
+    pub circuit_breaker_cooldown_secs: u64,
+    /// Consecutive successful half-open probes required to fully close the
+    /// circuit again.
+    pub half_open_success_threshold: u32,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            retry_backoff_ms: 50,
+            retry_max_backoff_ms: 1_000,
+            circuit_breaker_failure_threshold: 5,
+            circuit_breaker_cooldown_secs: 30,
+            half_open_success_threshold: 1,
+        }
+    }
+}
+
 /// Backend connection configuration (without runtime state).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackendConfig {
@@ -204,6 +283,112 @@ mod tests {
             serde_json::to_string(&StrategyType::Hybrid).unwrap(),
             r#""hybrid""#
         );
+        assert_eq!(
+            serde_json::to_string(&StrategyType::RoundRobin).unwrap(),
+            r#""round_robin""#
+        );
+    }
+
+    #[test]
+    fn forwarding_and_resilience_default_when_absent() {
+        let toml_text = r#"
+instance_id = "g1"
+
+[region]
+id = "r1"
+tier = "edge"
+network_zone = "z1"
+
+[listen]
+addr = "127.0.0.1"
+port = 9090
+
+[routing]
+strategy = "load"
+kv_block_size = 16
+overlap_score_credit = 0.0
+prefill_load_scale = 1.0
+temperature = 0.0
+session_affinity_ttl_secs = 60
+max_retries = 2
+
+[routing.weights]
+kv = 0.0
+load = 1.0
+topology = 0.0
+
+[cluster]
+bind_addr = "0.0.0.0:7946"
+seed_peers = []
+gossip_interval_ms = 200
+probe_timeout_ms = 1000
+suspect_timeout_secs = 5
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml_text).unwrap();
+        // Sections absent → defaults kick in (backwards compatible).
+        assert!(!cfg.forwarding.emit_token_ids);
+        let r = &cfg.resilience;
+        assert_eq!(r.retry_backoff_ms, 50);
+        assert_eq!(r.retry_max_backoff_ms, 1_000);
+        assert_eq!(r.circuit_breaker_failure_threshold, 5);
+        assert_eq!(r.circuit_breaker_cooldown_secs, 30);
+        assert_eq!(r.half_open_success_threshold, 1);
+    }
+
+    #[test]
+    fn forwarding_and_resilience_parse_explicit_values() {
+        let toml_text = r#"
+instance_id = "g1"
+
+[region]
+id = "r1"
+tier = "edge"
+network_zone = "z1"
+
+[listen]
+addr = "127.0.0.1"
+port = 9090
+
+[routing]
+strategy = "round_robin"
+kv_block_size = 16
+overlap_score_credit = 0.0
+prefill_load_scale = 1.0
+temperature = 0.0
+session_affinity_ttl_secs = 60
+max_retries = 2
+
+[routing.weights]
+kv = 0.0
+load = 1.0
+topology = 0.0
+
+[cluster]
+bind_addr = "0.0.0.0:7946"
+seed_peers = []
+gossip_interval_ms = 200
+probe_timeout_ms = 1000
+suspect_timeout_secs = 5
+
+[forwarding]
+emit_token_ids = true
+
+[resilience]
+retry_backoff_ms = 10
+retry_max_backoff_ms = 500
+circuit_breaker_failure_threshold = 3
+circuit_breaker_cooldown_secs = 15
+half_open_success_threshold = 2
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml_text).unwrap();
+        assert!(cfg.forwarding.emit_token_ids);
+        assert_eq!(cfg.routing.strategy, StrategyType::RoundRobin);
+        let r = &cfg.resilience;
+        assert_eq!(r.retry_backoff_ms, 10);
+        assert_eq!(r.retry_max_backoff_ms, 500);
+        assert_eq!(r.circuit_breaker_failure_threshold, 3);
+        assert_eq!(r.circuit_breaker_cooldown_secs, 15);
+        assert_eq!(r.half_open_success_threshold, 2);
     }
 
     #[test]

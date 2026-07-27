@@ -12,9 +12,12 @@
 //!   (vLLM / llama.cpp / GenericOpenAI / LLM-D HTTP gateways);
 //! - [`dynamo`]: NVIDIA Dynamo connector (NATS-based, feature-gated on `dynamo`);
 //! - [`registry`]: Registry for registering and looking up connectors by
-//!   [`BackendType`].
+//!   [`BackendType`];
+//! - [`resilience`]: Retry backoff and per-backend circuit breakers used by the
+//!   forwarding loop.
 
 pub mod connector;
 pub mod dynamo;
 pub mod openai_compat;
 pub mod registry;
+pub mod resilience;
