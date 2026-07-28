@@ -21,6 +21,7 @@ use dashmap::DashMap;
 use crate::connector::BackendConnector;
 use crate::dynamo::{DynamoConnector, DynamoConnectorConfig};
 use crate::openai_compat::OpenAICompatConnector;
+use crate::sglang::SglangConnector;
 
 /// Connector registry, indexed by backend identifier.
 pub struct ConnectorRegistry {
@@ -83,6 +84,8 @@ impl ConnectorRegistry {
     /// For each [`BackendConfig`] a corresponding connector instance is created:
     /// - `VllmEngine` / `LlamaCppEngine` / `GenericOpenAI` / `LlmDCluster` ->
     ///   [`OpenAICompatConnector`]
+    /// - `SglangEngine` -> [`SglangConnector`] (OpenAI chat path by default;
+    ///   native `/generate` when token-id forwarding is enabled)
     /// - `DynamoEngine` -> [`DynamoConnector`] (uses the endpoint URL as the
     ///   NATS URL; falls back to HTTP when the `dynamo` feature is disabled)
     ///
@@ -104,6 +107,15 @@ impl ConnectorRegistry {
                     OpenAICompatConnector::from_endpoint(
                         &cfg.endpoint,
                         cfg.backend_type.clone(),
+                        &cfg.region,
+                        cfg.models.clone(),
+                        cfg.kv_block_size,
+                    )
+                    .with_emit_token_ids(forwarding.emit_token_ids),
+                ),
+                BackendType::SglangEngine => Arc::new(
+                    SglangConnector::from_endpoint(
+                        &cfg.endpoint,
                         &cfg.region,
                         cfg.models.clone(),
                         cfg.kv_block_size,
@@ -252,6 +264,31 @@ mod tests {
         assert!(registry
             .get(&BackendId::new("edge-1", "10.0.0.2:8000"))
             .is_some());
+    }
+
+    #[test]
+    fn from_configs_creates_sglang_connector() {
+        let configs = vec![BackendConfig {
+            backend_type: BackendType::SglangEngine,
+            endpoint: Endpoint {
+                url: "http://localhost:30000".to_string(),
+                protocol: hier_kv_gateway_core::backend::Protocol::Http,
+            },
+            models: vec!["qwen2.5-7b".to_string()],
+            region: RegionId::new("edge-1"),
+            kv_block_size: 16,
+            quantization: None,
+        }];
+        let registry = ConnectorRegistry::from_configs(
+            &configs,
+            &RegionId::new("edge-1"),
+            &ForwardingConfig::default(),
+        );
+        let connector = registry
+            .get(&BackendId::new("edge-1", "localhost:30000"))
+            .expect("sglang connector registered");
+        assert_eq!(connector.backend_type(), BackendType::SglangEngine);
+        assert!(!connector.supports_kv_events());
     }
 
     #[test]

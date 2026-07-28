@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 xxhash-rust = { workspace = true }
 parking_lot = { workspace = true }
+dashmap = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -23,4 +24,8 @@ tokio = { workspace = true }
 
 [[bench]]
 name = "routing_hot_path"
+harness = false
+
+[[bench]]
+name = "adaptive_weights"
 harness = false

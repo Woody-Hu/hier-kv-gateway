@@ -23,6 +23,10 @@ use tracing::{debug, error, warn};
 
 use hier_kv_gateway_core::backend::BackendInfo;
 use hier_kv_gateway_core::config::RoutingConfig;
+use hier_kv_gateway_core::decision_event::{
+    CandidateScore, DecisionEvent, DecisionEventSink, DecisionOutcome, ForwardAttempt,
+    WeightSnapshot,
+};
 use hier_kv_gateway_core::error::HierKvGatewayError;
 use hier_kv_gateway_core::ids::{BackendId, RequestId, SessionId};
 use hier_kv_gateway_core::kv_event::{compute_block_hashes, BlockHashInput};
@@ -33,10 +37,12 @@ use hier_kv_gateway_connector::registry::ConnectorRegistry;
 use hier_kv_gateway_connector::resilience::{CircuitBreakerRegistry, RetryPolicy};
 use hier_kv_gateway_metadata::store::MetadataStore;
 use hier_kv_gateway_routing::engine::{RouteDecision, RoutingEngine};
+use hier_kv_gateway_routing::strategy::RoutingStrategy;
 
 use crate::openai_types::{
     OpenAIChatChunk, OpenAIChatRequest, OpenAIChatResponse, OpenAIModelList,
 };
+use crate::telemetry::DecisionEventBuffer;
 
 /// Optional trait allowing the HTTP layer to dynamically register a new peer
 /// (typically an external-Region gateway) into the running gossip mesh.
@@ -71,6 +77,16 @@ pub struct AppState {
     /// When `None`, the `POST /cluster/peers` endpoint returns `503 Service Unavailable`,
     /// indicating the gateway was started without a cluster transport.
     pub peer_registrar: Option<Arc<dyn PeerRegistrar>>,
+    /// Decision telemetry sink: one [`DecisionEvent`] is emitted per request
+    /// (fan-out to the admin ring buffer, tracing, and/or NDJSON file).
+    pub decision_sink: Arc<dyn DecisionEventSink>,
+    /// In-memory decision-event ring buffer backing
+    /// `GET /admin/decision_events`; `None` when `telemetry.buffer_size = 0`.
+    pub decision_buffer: Option<DecisionEventBuffer>,
+    /// Gateway instance identifier stamped onto every decision event.
+    pub gateway_instance: String,
+    /// Gateway region stamped onto every decision event.
+    pub gateway_region: String,
 }
 
 impl std::fmt::Debug for AppState {
@@ -122,10 +138,14 @@ impl RoutingMeta {
 /// Handles OpenAI-compatible Chat Completions requests, returning a streaming SSE or
 /// non-streaming JSON response based on the `stream` field. Response headers carry the
 /// routing decision information.
+///
+/// Exactly one [`DecisionEvent`] is emitted per request — on routing failure,
+/// forwarding exhaustion, or success — via [`AppState::decision_sink`].
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenAIChatRequest>,
 ) -> Response {
+    let total_start = std::time::Instant::now();
     let stream_mode = req.stream;
     let session_id = req.session.as_ref().map(SessionId::new);
     let model_name = req.model.clone();
@@ -145,9 +165,10 @@ pub async fn chat_completions(
     } else {
         Vec::new()
     };
+    let prompt_blocks = block_hashes.len() as u32;
     let ctx = RoutingContext {
         request_id: Some(request_id.clone()),
-        session_id,
+        session_id: session_id.clone(),
         model_name: Some(model_name.clone()),
         token_ids: inference.token_ids.clone(),
         block_hashes,
@@ -161,19 +182,47 @@ pub async fn chat_completions(
     // 3) Routing decision: fetch up to `1 + max_retries` ranked candidates so the
     //    forwarding loop can fail over to the next-best backend on errors.
     let max_attempts = state.routing_config.max_retries.saturating_add(1) as usize;
-    let decisions = match state
+    let route_start = std::time::Instant::now();
+    let routed = state
         .routing
         .route_candidates(&ctx, &state.metadata, max_attempts)
-        .await
-    {
+        .await;
+    let routing_latency_us = route_start.elapsed().as_micros() as u64;
+    let decisions = match routed {
         Ok(d) if !d.is_empty() => d,
         Ok(_) => {
             let e = HierKvGatewayError::BackendUnavailable;
             error!(request_id = %request_id, error = %e, "routing failed");
+            emit_decision_event(DecisionEventParams {
+                state: &state,
+                request_id: &request_id,
+                model: &model_name,
+                session_id: session_id.as_ref(),
+                decisions: &[],
+                attempts: Vec::new(),
+                selected: None,
+                prompt_blocks,
+                routing_latency_us,
+                total_start,
+                outcome: DecisionOutcome::RoutingFailed,
+            });
             return error_response(StatusCode::SERVICE_UNAVAILABLE, &e);
         }
         Err(e) => {
             error!(request_id = %request_id, error = %e, "routing failed");
+            emit_decision_event(DecisionEventParams {
+                state: &state,
+                request_id: &request_id,
+                model: &model_name,
+                session_id: session_id.as_ref(),
+                decisions: &[],
+                attempts: Vec::new(),
+                selected: None,
+                prompt_blocks,
+                routing_latency_us,
+                total_start,
+                outcome: DecisionOutcome::RoutingFailed,
+            });
             return error_response(StatusCode::SERVICE_UNAVAILABLE, &e);
         }
     };
@@ -181,7 +230,8 @@ pub async fn chat_completions(
     // 4) Forward along the ranked candidates with circuit-breaker gating and
     //    exponential backoff between attempts. The first candidate that yields
     //    a chunk stream wins; its decision metadata is reported to the client.
-    match forward_with_retries(&state, &decisions, &inference, &request_id).await {
+    let mut attempts: Vec<ForwardAttempt> = Vec::with_capacity(decisions.len());
+    match forward_with_retries(&state, &decisions, &inference, &request_id, prompt_blocks, &mut attempts).await {
         Ok((chunk_stream, routing_meta)) => {
             debug!(
                 request_id = %request_id,
@@ -190,6 +240,19 @@ pub async fn chat_completions(
                 kv_overlap = routing_meta.kv_overlap,
                 "routing decision completed"
             );
+            emit_decision_event(DecisionEventParams {
+                state: &state,
+                request_id: &request_id,
+                model: &model_name,
+                session_id: session_id.as_ref(),
+                decisions: &decisions,
+                attempts,
+                selected: Some(&routing_meta),
+                prompt_blocks,
+                routing_latency_us,
+                total_start,
+                outcome: DecisionOutcome::Success,
+            });
             // 5) Build the response based on the stream field
             if stream_mode {
                 build_sse_response(chunk_stream, &request_id, &model_name, &routing_meta)
@@ -206,9 +269,100 @@ pub async fn chat_completions(
         }
         Err(e) => {
             error!(request_id = %request_id, error = %e, "backend forwarding failed");
+            emit_decision_event(DecisionEventParams {
+                state: &state,
+                request_id: &request_id,
+                model: &model_name,
+                session_id: session_id.as_ref(),
+                decisions: &decisions,
+                attempts,
+                selected: None,
+                prompt_blocks,
+                routing_latency_us,
+                total_start,
+                outcome: DecisionOutcome::AllCandidatesFailed,
+            });
             error_response(StatusCode::BAD_GATEWAY, &e)
         }
     }
+}
+
+/// Inputs for building one [`DecisionEvent`]; see [`emit_decision_event`].
+struct DecisionEventParams<'a> {
+    state: &'a AppState,
+    request_id: &'a RequestId,
+    model: &'a str,
+    session_id: Option<&'a SessionId>,
+    decisions: &'a [RouteDecision],
+    attempts: Vec<ForwardAttempt>,
+    selected: Option<&'a RoutingMeta>,
+    prompt_blocks: u32,
+    routing_latency_us: u64,
+    total_start: std::time::Instant,
+    outcome: DecisionOutcome,
+}
+
+/// Build one decision event from the request lifecycle and emit it through
+/// the configured sink. Never fails: telemetry must not affect the request.
+fn emit_decision_event(p: DecisionEventParams) {
+    let candidates: Vec<CandidateScore> = p
+        .decisions
+        .iter()
+        .map(|d| CandidateScore {
+            backend: d.backend.to_string(),
+            // The engine pushes the selecting strategy's final score last.
+            score: d.scores.last().map(|(_, s)| *s).unwrap_or(0.0),
+            kv_overlap: d.kv_overlap,
+        })
+        .collect();
+
+    // Attach the effective hybrid weights only when the hybrid strategy made
+    // the winning decision (not for round_robin / affinity / degradation).
+    let hybrid_name = p.state.routing.hybrid.name();
+    let won_by_hybrid = p
+        .selected
+        .map(|m| m.strategy == hybrid_name)
+        .unwrap_or(false)
+        || p
+            .decisions
+            .first()
+            .map(|d| d.strategy == hybrid_name)
+            .unwrap_or(false);
+    let weights = if won_by_hybrid {
+        let w = p.state.routing.weight_snapshot();
+        Some(WeightSnapshot {
+            kv: w.kv,
+            load: w.load,
+            topology: w.topology,
+        })
+    } else {
+        None
+    };
+
+    let event = DecisionEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+        gateway_instance: p.state.gateway_instance.clone(),
+        gateway_region: p.state.gateway_region.clone(),
+        request_id: p.request_id.as_str().to_string(),
+        model: p.model.to_string(),
+        session_id: p.session_id.map(|s| s.as_str().to_string()),
+        strategy: p
+            .decisions
+            .first()
+            .map(|d| d.strategy.clone())
+            .unwrap_or_else(|| "none".to_string()),
+        weights,
+        candidates,
+        attempts: p.attempts,
+        selected_backend: p.selected.map(|m| m.backend.clone()),
+        kv_overlap: p.selected.map(|m| m.kv_overlap).unwrap_or(0),
+        prompt_blocks: p.prompt_blocks,
+        routing_latency_us: p.routing_latency_us,
+        total_latency_us: p.total_start.elapsed().as_micros() as u64,
+        outcome: p.outcome,
+    };
+    p.state.decision_sink.emit(&event);
 }
 
 /// Attempt to forward `inference` to the ranked `decisions` in order.
@@ -222,6 +376,12 @@ pub async fn chat_completions(
 /// 4. On failure record `on_failure`, sleep `retry_policy.backoff(failures)`
 ///    and move on to the next candidate.
 ///
+/// Every considered candidate (including circuit-skipped ones) appends one
+/// [`ForwardAttempt`] to `attempts` for the decision event. When an adaptive
+/// weight controller is attached to the routing engine, per-attempt
+/// success/failure + latency and the winning request's KV hit ratio are fed
+/// back into it.
+///
 /// Returns the last forwarding error when every allowed candidate failed, or
 /// [`HierKvGatewayError::BackendUnavailable`] when every candidate was
 /// short-circuited.
@@ -230,9 +390,12 @@ async fn forward_with_retries(
     decisions: &[RouteDecision],
     inference: &InferenceRequest,
     request_id: &RequestId,
+    prompt_blocks: u32,
+    attempts: &mut Vec<ForwardAttempt>,
 ) -> std::result::Result<(BoxStream<'static, InferenceChunk>, RoutingMeta), HierKvGatewayError> {
     let mut failures: u32 = 0;
     let mut last_err: Option<HierKvGatewayError> = None;
+    let adaptive = state.routing.adaptive_controller().cloned();
 
     for decision in decisions {
         // 1. Circuit-breaker gate.
@@ -242,6 +405,12 @@ async fn forward_with_retries(
                 backend = %decision.backend,
                 "skipping candidate with open circuit"
             );
+            attempts.push(ForwardAttempt {
+                backend: decision.backend.to_string(),
+                success: false,
+                skipped_open_circuit: true,
+                error: None,
+            });
             continue;
         }
 
@@ -256,17 +425,38 @@ async fn forward_with_retries(
         let Some(connector) = state.connectors.get(&decision.backend) else {
             warn!(backend = %decision.backend, "no connector registered for this backend");
             failures += 1;
-            last_err = Some(HierKvGatewayError::ConnectorError(format!(
+            let e = HierKvGatewayError::ConnectorError(format!(
                 "no connector for backend {}",
                 decision.backend
-            )));
+            ));
+            attempts.push(ForwardAttempt {
+                backend: decision.backend.to_string(),
+                success: false,
+                skipped_open_circuit: false,
+                error: Some(e.to_string()),
+            });
+            if let Some(ctl) = adaptive.as_ref() {
+                ctl.record_failure(&decision.backend);
+            }
+            last_err = Some(e);
             continue;
         };
 
         // 3. Attempt the forward.
+        let attempt_start = std::time::Instant::now();
         match connector.forward(&decision.backend, inference).await {
             Ok(stream) => {
                 state.breakers.on_success(&decision.backend);
+                if let Some(ctl) = adaptive.as_ref() {
+                    ctl.record_success(&decision.backend, attempt_start.elapsed());
+                    ctl.record_kv_overlap(decision.kv_overlap, prompt_blocks);
+                }
+                attempts.push(ForwardAttempt {
+                    backend: decision.backend.to_string(),
+                    success: true,
+                    skipped_open_circuit: false,
+                    error: None,
+                });
                 if failures > 0 {
                     debug!(
                         request_id = %request_id,
@@ -280,6 +470,9 @@ async fn forward_with_retries(
             }
             Err(e) => {
                 state.breakers.on_failure(&decision.backend);
+                if let Some(ctl) = adaptive.as_ref() {
+                    ctl.record_failure(&decision.backend);
+                }
                 warn!(
                     request_id = %request_id,
                     backend = %decision.backend,
@@ -287,6 +480,12 @@ async fn forward_with_retries(
                     error = %e,
                     "forward attempt failed"
                 );
+                attempts.push(ForwardAttempt {
+                    backend: decision.backend.to_string(),
+                    success: false,
+                    skipped_open_circuit: false,
+                    error: Some(e.to_string()),
+                });
                 failures += 1;
                 last_err = Some(e);
             }
@@ -590,6 +789,42 @@ pub async fn admin_metrics(
     }
 }
 
+/// Query parameters for `GET /admin/decision_events`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DecisionEventsQuery {
+    /// Return at most the newest `limit` buffered events; absent/0 returns
+    /// everything currently buffered.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `GET /admin/decision_events?limit=N`
+///
+/// Returns the in-memory ring buffer of recent routing decision events
+/// (newest last). External analysis systems can poll this endpoint for
+/// low-volume introspection; high-volume pipelines should consume the
+/// tracing/NDJSON sinks configured via `[telemetry]` instead.
+///
+/// Returns `404` when the buffer is disabled (`telemetry.buffer_size = 0`).
+pub async fn admin_decision_events(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DecisionEventsQuery>,
+) -> Response {
+    match &state.decision_buffer {
+        Some(buf) => Json(buf.snapshot(params.limit.unwrap_or(0))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "message": "decision event buffer is disabled (telemetry.buffer_size = 0)",
+                    "type": "not_found"
+                }
+            })),
+        )
+            .into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cluster peer management
 // ---------------------------------------------------------------------------
@@ -687,6 +922,7 @@ pub(crate) mod test_support {
                 load: 0.30,
                 topology: 0.20,
             },
+            adaptive: hier_kv_gateway_core::config::AdaptiveConfig::default(),
         };
         let hybrid = HybridStrategy::new(
             Box::new(KvAwareStrategy::default()),
@@ -717,6 +953,10 @@ pub(crate) mod test_support {
             )),
             retry_policy: RetryPolicy::default(),
             peer_registrar: None,
+            decision_sink: Arc::new(hier_kv_gateway_core::decision_event::NoopSink),
+            decision_buffer: Some(DecisionEventBuffer::new(64)),
+            gateway_instance: "test-gw".to_string(),
+            gateway_region: self_region.to_string(),
         }
     }
 }
@@ -937,9 +1177,10 @@ mod tests {
             let state = build_state(vec![StubConnector::failing("a"), StubConnector::succeeding("b")]);
             let decisions = vec![decision("a"), decision("b")];
             let req = inference();
+            let mut attempts = Vec::new();
 
             let (stream, meta) =
-                forward_with_retries(&state, &decisions, &req, &req.request_id)
+                forward_with_retries(&state, &decisions, &req, &req.request_id, 1, &mut attempts)
                     .await
                     .expect("second candidate should succeed");
             assert_eq!(meta.backend, "r1/b");
@@ -948,6 +1189,10 @@ mod tests {
             // The stream really came from the winning backend.
             let chunks: Vec<InferenceChunk> = stream.collect().await;
             assert!(matches!(chunks.first(), Some(InferenceChunk::Done { .. })));
+            // One failed attempt + one successful attempt were recorded.
+            assert_eq!(attempts.len(), 2);
+            assert!(!attempts[0].success && attempts[0].error.is_some());
+            assert!(attempts[1].success);
         }
 
         #[tokio::test]
@@ -955,8 +1200,10 @@ mod tests {
             let state = build_state(vec![StubConnector::failing("a"), StubConnector::failing("b")]);
             let decisions = vec![decision("a"), decision("b")];
             let req = inference();
+            let mut attempts = Vec::new();
 
-            let result = forward_with_retries(&state, &decisions, &req, &req.request_id).await;
+            let result =
+                forward_with_retries(&state, &decisions, &req, &req.request_id, 1, &mut attempts).await;
             match result {
                 Err(HierKvGatewayError::ConnectorError(msg)) => {
                     assert!(msg.contains("r1/b"), "last error should be from b: {msg}");
@@ -964,6 +1211,8 @@ mod tests {
                 Err(other) => panic!("expected ConnectorError, got {other:?}"),
                 Ok(_) => panic!("all candidates failing must error"),
             }
+            assert_eq!(attempts.len(), 2);
+            assert!(attempts.iter().all(|a| !a.success));
         }
 
         #[tokio::test]
@@ -975,11 +1224,15 @@ mod tests {
 
             let decisions = vec![decision("a"), decision("b")];
             let req = inference();
+            let mut attempts = Vec::new();
             let (_stream, meta) =
-                forward_with_retries(&state, &decisions, &req, &req.request_id)
+                forward_with_retries(&state, &decisions, &req, &req.request_id, 1, &mut attempts)
                     .await
                     .expect("b should serve while a is short-circuited");
             assert_eq!(meta.backend, "r1/b");
+            assert_eq!(attempts.len(), 2);
+            assert!(attempts[0].skipped_open_circuit);
+            assert!(attempts[1].success);
         }
 
         #[tokio::test]
@@ -989,11 +1242,15 @@ mod tests {
 
             let decisions = vec![decision("a")];
             let req = inference();
-            let result = forward_with_retries(&state, &decisions, &req, &req.request_id).await;
+            let mut attempts = Vec::new();
+            let result =
+                forward_with_retries(&state, &decisions, &req, &req.request_id, 1, &mut attempts).await;
             match result {
                 Err(e) => assert!(matches!(e, HierKvGatewayError::BackendUnavailable)),
                 Ok(_) => panic!("short-circuited candidates must yield BackendUnavailable"),
             }
+            assert_eq!(attempts.len(), 1);
+            assert!(attempts[0].skipped_open_circuit);
         }
 
         #[tokio::test]
@@ -1002,11 +1259,15 @@ mod tests {
             let state = build_state(vec![StubConnector::succeeding("b")]);
             let decisions = vec![decision("a"), decision("b")];
             let req = inference();
+            let mut attempts = Vec::new();
             let (_stream, meta) =
-                forward_with_retries(&state, &decisions, &req, &req.request_id)
+                forward_with_retries(&state, &decisions, &req, &req.request_id, 1, &mut attempts)
                     .await
                     .expect("b should serve after a resolves to nothing");
             assert_eq!(meta.backend, "r1/b");
+            assert_eq!(attempts.len(), 2);
+            assert!(!attempts[0].success);
+            assert!(attempts[0].error.is_some());
         }
     }
 }

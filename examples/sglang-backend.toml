@@ -1,0 +1,112 @@
+# Hier KV Gateway — SGLang backend example configuration.
+#
+# This file demonstrates routing across a pair of SGLang servers
+# (`python -m sglang.launch_server ...`) with:
+#
+#   - Native `/generate` token-id forwarding (radix-cache friendly):
+#     the gateway tokenizes once, routes on the KV block hashes of that
+#     exact token sequence, and SGLang prefills from `input_ids` without
+#     re-tokenization. Requires clients to send `token_ids` (see the
+#     gateway's tokenization path) and `forwarding.emit_token_ids = true`.
+#
+#   - Scheduler-accurate load metrics from `GET /get_server_info`
+#     (`internal_states[0].num_running_reqs` / `num_queue_reqs` /
+#     `num_used_tokens`), with automatic fallback to Prometheus `/metrics`
+#     when the server is started with `--enable-metrics`.
+#
+#   - Adaptive hybrid weights: an EMA feedback controller nudges the
+#     static [routing.weights] using forward success rate, KV hit ratio,
+#     and fleet load spread. Adjustments are bounded by `max_adjustment`
+#     and each weight keeps a `min_weight` floor.
+#
+#   - Decision telemetry: every routing decision is exported as one NDJSON
+#     line per request to `file_path` (plus an in-memory ring buffer served
+#     at `GET /admin/decision_events`).
+#
+# Backend startup for reference:
+#   python -m sglang.launch_server --model qwen2.5-7b --port 30000 \
+#       --enable-metrics
+#   python -m sglang.launch_server --model qwen2.5-7b --port 30001 \
+#       --enable-metrics
+#
+# Usage:
+#   hier-kv-gateway --config examples/sglang-backend.toml
+
+instance_id = "gateway-sglang-1"
+
+[region]
+id = "cloud-cn-beijing"
+tier = "cloud"
+network_zone = "cn-beijing-1"
+geo = { lat = 39.9, lon = 116.4 }
+
+[listen]
+addr = "0.0.0.0"
+port = 8080
+
+[routing]
+strategy = "hybrid"
+# Must match the radix-cache page semantics you want the gateway to track;
+# 16 tokens/block is a common choice.
+kv_block_size = 16
+overlap_score_credit = 1.0
+prefill_load_scale = 1.0
+temperature = 0.0
+session_affinity_ttl_secs = 300
+max_retries = 3
+
+# Static base weights — the adaptive controller perturbs these at runtime.
+[routing.weights]
+kv = 0.35
+load = 0.30
+topology = 0.20
+
+# Adaptive weight feedback controller (opt-in).
+[routing.adaptive]
+enabled = true
+# EMA smoothing: 0.2 = smooth, 0.5 = reactive.
+ema_alpha = 0.2
+# Each weight may move at most ±25% relative to its base value.
+max_adjustment = 0.25
+# No signal can be starved below 5% of the normalized mix.
+min_weight = 0.05
+# Recompute weights at most every 10s; the hot path reuses cached weights.
+adjust_interval_secs = 10
+
+# Forward pre-tokenized prompts to SGLang's native /generate endpoint.
+[forwarding]
+emit_token_ids = true
+
+[cluster]
+bind_addr = "0.0.0.0:7946"
+seed_peers = []
+gossip_interval_ms = 1000
+probe_timeout_ms = 5000
+suspect_timeout_secs = 10
+
+# Decision telemetry: one NDJSON line per routing decision.
+[telemetry]
+mode = "file"
+file_path = "/var/log/hier/decision_events.ndjson"
+# In-memory ring buffer for GET /admin/decision_events (0 disables).
+buffer_size = 1024
+
+# ----------------------------------------------------------------------
+# Backend 1: SGLang server on GPU 0 (localhost:30000)
+# ----------------------------------------------------------------------
+[[backends]]
+backend_type = "sglang_engine"
+endpoint = { url = "http://localhost:30000", protocol = "http" }
+models = ["qwen2.5-7b"]
+region = "cloud-cn-beijing"
+kv_block_size = 16
+
+# ----------------------------------------------------------------------
+# Backend 2: SGLang server on GPU 1 (localhost:30001)
+# ----------------------------------------------------------------------
+[[backends]]
+backend_type = "sglang_engine"
+endpoint = { url = "http://localhost:30001", protocol = "http" }
+models = ["qwen2.5-7b"]
+region = "cloud-cn-beijing"
+kv_block_size = 16

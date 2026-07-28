@@ -25,6 +25,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use hier_kv_gateway_api::handlers::{AppState, PeerRegistrar};
 use hier_kv_gateway_api::server;
+use hier_kv_gateway_api::telemetry::build_telemetry;
 use hier_kv_gateway_cluster::gossip::GossipEngine;
 use hier_kv_gateway_cluster::member::MemberList;
 use hier_kv_gateway_cluster::region_view::RegionMemberView;
@@ -35,6 +36,7 @@ use hier_kv_gateway_core::topology::{GeoCoord, RegionInfo};
 use hier_kv_gateway_metadata::store::MetadataStore;
 use hier_kv_gateway_connector::registry::ConnectorRegistry;
 use hier_kv_gateway_connector::resilience::{CircuitBreakerRegistry, RetryPolicy};
+use hier_kv_gateway_routing::adaptive::AdaptiveWeightController;
 use hier_kv_gateway_routing::engine::RoutingEngine;
 use hier_kv_gateway_routing::hybrid::HybridStrategy;
 use hier_kv_gateway_routing::kv_aware::KvAwareStrategy;
@@ -99,6 +101,15 @@ async fn main() -> Result<()> {
         Duration::from_millis(config.resilience.retry_backoff_ms),
         Duration::from_millis(config.resilience.retry_max_backoff_ms),
     );
+    // Decision telemetry: ring buffer (admin endpoint) + optional tracing /
+    // NDJSON-file sinks, driven by the `[telemetry]` section.
+    let telemetry = build_telemetry(&config.telemetry).await;
+    info!(
+        mode = ?config.telemetry.mode,
+        buffer_size = config.telemetry.buffer_size,
+        adaptive_enabled = config.routing.adaptive.enabled,
+        "decision telemetry configured"
+    );
     let app_state = AppState {
         metadata: metadata.clone(),
         routing,
@@ -109,6 +120,10 @@ async fn main() -> Result<()> {
         peer_registrar: cluster_state
             .as_ref()
             .map(|cs| cs.peer_registrar.clone()),
+        decision_sink: telemetry.sink,
+        decision_buffer: telemetry.buffer,
+        gateway_instance: config.instance_id.to_string(),
+        gateway_region: config.region.id.to_string(),
     };
 
     let listen_addr = format!("{}:{}", config.listen.addr, config.listen.port);
@@ -219,6 +234,10 @@ async fn discover_and_register_backends(
 /// - `round_robin` — the metadata-free rotation baseline;
 /// - `kv` / `model` / `load` / `topology` — the corresponding single
 ///   sub-strategy, lifted out of the hybrid ensemble.
+///
+/// When `[routing.adaptive] enabled = true`, an EMA-based
+/// [`AdaptiveWeightController`] is attached to the hybrid strategy so its
+/// weights react to forward outcomes and gossip-fed load state at runtime.
 fn build_routing_engine(config: &GatewayConfig) -> RoutingEngine {
     use hier_kv_gateway_core::config::StrategyType;
     use hier_kv_gateway_routing::round_robin::RoundRobinStrategy;
@@ -237,7 +256,7 @@ fn build_routing_engine(config: &GatewayConfig) -> RoutingEngine {
         w_bw: 0.0,
         self_region: config.region.id.clone(),
     });
-    let hybrid = HybridStrategy::new(
+    let mut hybrid = HybridStrategy::new(
         kv,
         model,
         load,
@@ -245,6 +264,10 @@ fn build_routing_engine(config: &GatewayConfig) -> RoutingEngine {
         r.weights.clone(),
         r.temperature,
     );
+    if r.adaptive.enabled {
+        let controller = AdaptiveWeightController::new(r.weights.clone(), r.adaptive.clone());
+        hybrid = hybrid.with_adaptive(Arc::new(controller));
+    }
     let session_affinity_ttl = Duration::from_secs(r.session_affinity_ttl_secs);
     let engine = RoutingEngine::new(
         hybrid,
@@ -436,4 +459,71 @@ fn print_startup_banner(config: &GatewayConfig) {
         "cluster configuration"
     );
     info!("======================================");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hier_kv_gateway_core::backend::BackendType;
+    use hier_kv_gateway_core::config::TelemetryMode;
+
+    /// Path to the workspace-root `examples/` directory.
+    fn example_path(name: &str) -> String {
+        format!("{}/../../examples/{}", env!("CARGO_MANIFEST_DIR"), name)
+    }
+
+    /// Every shipped example config must parse into `GatewayConfig`.
+    #[test]
+    fn example_configs_parse() {
+        for name in [
+            "hier-kv-gateway.toml",
+            "multi-backend.toml",
+            "sglang-backend.toml",
+        ] {
+            let path = example_path(name);
+            load_from_file(&path).unwrap_or_else(|e| panic!("{} failed to parse: {}", path, e));
+        }
+    }
+
+    /// The SGLang example exercises the new sections end to end:
+    /// `sglang_engine` backends, `[forwarding]`, `[routing.adaptive]`,
+    /// and `[telemetry]`.
+    #[test]
+    fn sglang_example_wires_new_sections() {
+        let cfg = load_from_file(example_path("sglang-backend.toml")).unwrap();
+
+        assert_eq!(cfg.backends.len(), 2);
+        assert!(cfg
+            .backends
+            .iter()
+            .all(|b| b.backend_type == BackendType::SglangEngine));
+        assert!(cfg.forwarding.emit_token_ids);
+        assert!(cfg.routing.adaptive.enabled);
+        assert_eq!(cfg.telemetry.mode, TelemetryMode::File);
+        assert_eq!(cfg.telemetry.buffer_size, 1024);
+    }
+
+    /// Building the routing engine from the SGLang example must attach an
+    /// adaptive controller (weights snapshot reflects controller state).
+    #[test]
+    fn sglang_example_builds_adaptive_engine() {
+        let cfg = load_from_file(example_path("sglang-backend.toml")).unwrap();
+        let engine = build_routing_engine(&cfg);
+        let w = engine.weight_snapshot();
+        // Weights normalize to <= 1 and stay positive.
+        assert!(w.kv > 0.0 && w.load > 0.0 && w.topology > 0.0);
+        assert!(w.kv <= 1.0 && w.load <= 1.0 && w.topology <= 1.0);
+    }
+
+    /// The multi-backend example must keep building a static-weight engine.
+    #[test]
+    fn multi_backend_example_builds_static_engine() {
+        let cfg = load_from_file(example_path("multi-backend.toml")).unwrap();
+        assert!(!cfg.routing.adaptive.enabled);
+        let engine = build_routing_engine(&cfg);
+        let w = engine.weight_snapshot();
+        assert!((w.kv - 0.35).abs() < 1e-9);
+        assert!((w.load - 0.30).abs() < 1e-9);
+        assert!((w.topology - 0.20).abs() < 1e-9);
+    }
 }

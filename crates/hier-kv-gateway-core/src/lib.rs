@@ -7,6 +7,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod decision_event;
 pub mod error;
 pub mod ids;
 pub mod kv_event;
