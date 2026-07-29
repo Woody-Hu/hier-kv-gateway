@@ -31,6 +31,9 @@ pub struct GatewayConfig {
     /// Retry / circuit-breaker resilience behavior for backend forwarding.
     #[serde(default)]
     pub resilience: ResilienceConfig,
+    /// Decision telemetry: how routing decision events are exported.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     /// Configured backend list; empty by default.
     #[serde(default)]
     pub backends: Vec<BackendConfig>,
@@ -121,6 +124,99 @@ pub struct RoutingConfig {
     pub max_retries: u32,
     /// Weights for the three dimensions under the hybrid strategy.
     pub weights: StrategyWeights,
+    /// Adaptive weight feedback controller (disabled by default).
+    #[serde(default)]
+    pub adaptive: AdaptiveConfig,
+}
+
+/// Adaptive hybrid-weight feedback configuration.
+///
+/// When enabled, an EMA-based controller nudges the static
+/// [`StrategyWeights`] at runtime using two signal families:
+///
+/// * **Execution metrics** collected by the gateway's own forwarding loop:
+///   per-backend forward success rate and latency, plus the KV hit ratio of
+///   served requests.
+/// * **Broadcast node state**: the load snapshots peers publish over gossip
+///   (they land in the shared [`crate::metrics::BackendMetrics`] store), used
+///   to measure load spread across the fleet.
+///
+/// Adjustments are bounded around the configured base weights so the system
+/// degrades gracefully to the static behaviour when signals disappear.
+///
+/// All fields carry defaults; `[routing.adaptive] enabled = true` opts in.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdaptiveConfig {
+    /// Master switch. When `false` the hybrid strategy always uses the static
+    /// base weights.
+    pub enabled: bool,
+    /// EMA smoothing factor in `(0, 1]`; higher values react faster but are
+    /// noisier.
+    pub ema_alpha: f64,
+    /// Maximum relative adjustment applied to any base weight, e.g. `0.25`
+    /// allows `weight * (1 ± 0.25)` before normalization.
+    pub max_adjustment: f64,
+    /// Floor applied to every normalized weight so no signal can be fully
+    /// starved out.
+    pub min_weight: f64,
+    /// Minimum interval (seconds) between two weight recomputations; the hot
+    /// path reuses the cached weights in between.
+    pub adjust_interval_secs: u64,
+}
+
+impl Default for AdaptiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ema_alpha: 0.2,
+            max_adjustment: 0.25,
+            min_weight: 0.05,
+            adjust_interval_secs: 10,
+        }
+    }
+}
+
+/// Decision telemetry export configuration.
+///
+/// The gateway emits one [`crate::decision_event::DecisionEvent`] per request.
+/// This section selects where those events go; an in-memory ring buffer for
+/// the `GET /admin/decision_events` endpoint is always maintained (its size is
+/// configurable and can be disabled with `buffer_size = 0`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelemetryConfig {
+    /// Export mode for the durable/streaming sink.
+    pub mode: TelemetryMode,
+    /// Output file for [`TelemetryMode::File`] (NDJSON, one event per line).
+    pub file_path: String,
+    /// Capacity of the in-memory ring buffer backing
+    /// `GET /admin/decision_events`; `0` disables the buffer.
+    pub buffer_size: usize,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            mode: TelemetryMode::None,
+            file_path: "decision_events.ndjson".to_string(),
+            buffer_size: 256,
+        }
+    }
+}
+
+/// Where decision events are exported beyond the in-memory buffer.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryMode {
+    /// No external export (in-memory buffer only).
+    None,
+    /// Emit events as structured `tracing` records on the
+    /// `hier_kv_gateway.decision_events` target, letting the existing log
+    /// pipeline (Loki, ELK, journald, ...) carry them.
+    Tracing,
+    /// Append events to `file_path` as NDJSON via a background writer task.
+    File,
 }
 
 /// Cluster membership protocol configuration (based on SWIM/gossip).
@@ -389,6 +485,123 @@ half_open_success_threshold = 2
         assert_eq!(r.circuit_breaker_failure_threshold, 3);
         assert_eq!(r.circuit_breaker_cooldown_secs, 15);
         assert_eq!(r.half_open_success_threshold, 2);
+    }
+
+    #[test]
+    fn telemetry_and_adaptive_default_when_absent() {
+        // The minimal config from `parse_minimal_config` carries neither
+        // section; both must fall back to their backwards-compatible defaults.
+        let toml_text = r#"
+instance_id = "g1"
+
+[region]
+id = "r1"
+tier = "edge"
+network_zone = "z1"
+
+[listen]
+addr = "127.0.0.1"
+port = 9090
+
+[routing]
+strategy = "hybrid"
+kv_block_size = 16
+overlap_score_credit = 0.0
+prefill_load_scale = 1.0
+temperature = 0.0
+session_affinity_ttl_secs = 60
+max_retries = 2
+
+[routing.weights]
+kv = 0.35
+load = 0.30
+topology = 0.20
+
+[cluster]
+bind_addr = "0.0.0.0:7946"
+seed_peers = []
+gossip_interval_ms = 200
+probe_timeout_ms = 1000
+suspect_timeout_secs = 5
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml_text).unwrap();
+        assert!(!cfg.routing.adaptive.enabled);
+        assert!((cfg.routing.adaptive.ema_alpha - 0.2).abs() < 1e-9);
+        assert_eq!(cfg.telemetry.mode, TelemetryMode::None);
+        assert_eq!(cfg.telemetry.buffer_size, 256);
+        assert_eq!(cfg.telemetry.file_path, "decision_events.ndjson");
+    }
+
+    #[test]
+    fn telemetry_and_adaptive_parse_explicit_values() {
+        let toml_text = r#"
+instance_id = "g1"
+
+[region]
+id = "r1"
+tier = "edge"
+network_zone = "z1"
+
+[listen]
+addr = "127.0.0.1"
+port = 9090
+
+[routing]
+strategy = "hybrid"
+kv_block_size = 16
+overlap_score_credit = 0.0
+prefill_load_scale = 1.0
+temperature = 0.0
+session_affinity_ttl_secs = 60
+max_retries = 2
+
+[routing.weights]
+kv = 0.35
+load = 0.30
+topology = 0.20
+
+[routing.adaptive]
+enabled = true
+ema_alpha = 0.3
+max_adjustment = 0.4
+min_weight = 0.1
+adjust_interval_secs = 5
+
+[cluster]
+bind_addr = "0.0.0.0:7946"
+seed_peers = []
+gossip_interval_ms = 200
+probe_timeout_ms = 1000
+suspect_timeout_secs = 5
+
+[telemetry]
+mode = "file"
+file_path = "/var/log/hier/decisions.ndjson"
+buffer_size = 1024
+"#;
+        let cfg: GatewayConfig = toml::from_str(toml_text).unwrap();
+        let a = &cfg.routing.adaptive;
+        assert!(a.enabled);
+        assert!((a.ema_alpha - 0.3).abs() < 1e-9);
+        assert!((a.max_adjustment - 0.4).abs() < 1e-9);
+        assert!((a.min_weight - 0.1).abs() < 1e-9);
+        assert_eq!(a.adjust_interval_secs, 5);
+        let t = &cfg.telemetry;
+        assert_eq!(t.mode, TelemetryMode::File);
+        assert_eq!(t.file_path, "/var/log/hier/decisions.ndjson");
+        assert_eq!(t.buffer_size, 1024);
+    }
+
+    #[test]
+    fn telemetry_mode_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TelemetryMode::Tracing).unwrap(),
+            r#""tracing""#
+        );
+        assert_eq!(
+            serde_json::from_str::<TelemetryMode>(r#""file""#).unwrap(),
+            TelemetryMode::File
+        );
     }
 
     #[test]

@@ -131,6 +131,26 @@ impl RoutingEngine {
         &self.prefix_history
     }
 
+    /// Borrow the adaptive weight controller attached to the embedded hybrid
+    /// strategy, if any.
+    ///
+    /// The gateway's forwarding loop uses this handle to feed execution
+    /// metrics (per-backend forward success/failure/latency, KV hit ratio)
+    /// back into the controller after each request.
+    pub fn adaptive_controller(&self) -> Option<&Arc<crate::adaptive::AdaptiveWeightController>> {
+        self.hybrid.adaptive()
+    }
+
+    /// Snapshot of the hybrid weights most recently used for scoring.
+    ///
+    /// Returns the adaptive controller's cached effective weights when one is
+    /// attached, otherwise the static configured weights. Intended for
+    /// decision telemetry; callers should only attach the snapshot to events
+    /// whose winning strategy is the hybrid one.
+    pub fn weight_snapshot(&self) -> hier_kv_gateway_core::config::StrategyWeights {
+        self.hybrid.weight_snapshot()
+    }
+
     /// Execute the routing decision and return the single best backend.
     ///
     /// Equivalent to [`route_candidates`](Self::route_candidates) with
@@ -212,9 +232,16 @@ impl RoutingEngine {
         //    The affinity head (when present) is excluded so it is not scored twice.
         let head_backend = head.as_ref().map(|h| &h.backend);
         let collect = |ids: Vec<BackendId>| -> Vec<BackendId> {
-            ids.into_iter()
+            let mut ids: Vec<BackendId> = ids
+                .into_iter()
                 .filter(|id| Some(id) != head_backend)
-                .collect()
+                .collect();
+            // Deterministic candidate order: the metadata store is backed by
+            // DashMaps whose iteration order is unspecified, which would make
+            // order-sensitive strategies (round-robin rotation) and the
+            // emitted decision events nondeterministic across runs.
+            ids.sort();
+            ids
         };
         let candidates: Vec<BackendId> = match ctx.model_name.as_deref() {
             Some(name) if !name.is_empty() => {

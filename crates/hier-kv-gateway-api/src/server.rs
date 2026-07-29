@@ -15,7 +15,8 @@ use tracing::{info, warn};
 use hier_kv_gateway_core::error::{HierKvGatewayError, Result as HierKvGatewayResult};
 
 use crate::handlers::{
-    admin_backends, admin_metrics, chat_completions, cluster_peers, health, list_models, AppState,
+    admin_backends, admin_decision_events, admin_metrics, chat_completions, cluster_peers, health,
+    list_models, AppState,
 };
 
 /// Path constants, kept consistent with the documentation.
@@ -31,6 +32,8 @@ mod routes {
     /// Admin endpoint: metrics for a single backend.
     /// axum 0.8 uses the `{id}` placeholder syntax.
     pub const ADMIN_BACKEND_METRICS: &str = "/admin/backends/{id}/metrics";
+    /// Admin endpoint: recent routing decision events (in-memory ring buffer).
+    pub const ADMIN_DECISION_EVENTS: &str = "/admin/decision_events";
     /// Cluster endpoint: dynamically register a peer gateway.
     pub const CLUSTER_PEERS: &str = "/cluster/peers";
 }
@@ -43,6 +46,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(routes::HEALTH, get(health))
         .route(routes::ADMIN_BACKENDS, get(admin_backends))
         .route(routes::ADMIN_BACKEND_METRICS, get(admin_metrics))
+        .route(routes::ADMIN_DECISION_EVENTS, get(admin_decision_events))
         .route(routes::CLUSTER_PEERS, post(cluster_peers))
         .with_state(state)
 }
@@ -188,6 +192,43 @@ mod tests {
             .unwrap();
         // The path contains two `/`; axum's {id} only matches the whole segment before
         // the last one. Expect 404 here because route matching fails.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn admin_decision_events_returns_empty_buffer() {
+        let state = Arc::new(build_test_app_state("test-region"));
+        let app = create_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/decision_events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.is_array());
+        assert_eq!(v.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_decision_events_404_when_buffer_disabled() {
+        let mut state = build_test_app_state("test-region");
+        state.decision_buffer = None;
+        let app = create_router(Arc::new(state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/decision_events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

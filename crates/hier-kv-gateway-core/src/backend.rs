@@ -28,6 +28,12 @@ pub enum BackendType {
     /// OpenAI-compatible connector when the feature is disabled; the variant
     /// is always present so that configs and serialized state remain stable.
     DynamoEngine,
+    /// SGLang engine backend (`sglang.launch_server`).
+    ///
+    /// Served by the dedicated SGLang connector: OpenAI-compatible chat
+    /// forwarding, native `/generate` token-id forwarding (radix-cache
+    /// friendly), and `/get_server_info`-based load metrics.
+    SglangEngine,
 }
 
 /// Network protocol.

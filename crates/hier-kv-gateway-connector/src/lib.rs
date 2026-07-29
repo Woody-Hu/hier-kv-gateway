@@ -21,3 +21,4 @@ pub mod dynamo;
 pub mod openai_compat;
 pub mod registry;
 pub mod resilience;
+pub mod sglang;

@@ -24,3 +24,8 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+criterion = { workspace = true }
+
+[[bench]]
+name = "decision_events"
+harness = false

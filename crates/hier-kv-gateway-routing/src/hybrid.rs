@@ -13,6 +13,7 @@
 //! Outputs a `ScoredBackend` list sorted in descending order by `hybrid_score`; the `score` field is the hybrid score.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -22,6 +23,7 @@ use hier_kv_gateway_core::ids::BackendId;
 use hier_kv_gateway_core::request::{RoutingContext, ScoredBackend};
 use hier_kv_gateway_metadata::store::MetadataStore;
 
+use crate::adaptive::AdaptiveWeightController;
 use crate::strategy::RoutingStrategy;
 
 /// Load metrics staleness threshold: when exceeded, the load weight is discounted.
@@ -41,6 +43,9 @@ pub struct HybridStrategy {
     pub weights: StrategyWeights,
     /// Routing temperature parameter: when > 0 the caller samples via softmax; when == 0 greedily pick the highest score.
     pub temperature: f64,
+    /// Optional adaptive weight controller; when present, the effective
+    /// weights come from its feedback loop instead of `weights`.
+    adaptive: Option<Arc<AdaptiveWeightController>>,
 }
 
 impl HybridStrategy {
@@ -60,6 +65,49 @@ impl HybridStrategy {
             topology,
             weights,
             temperature,
+            adaptive: None,
+        }
+    }
+
+    /// Attach an adaptive weight controller (builder style).
+    ///
+    /// When attached, `evaluate` asks the controller for the effective
+    /// weights on every call; the controller recomputes at its configured
+    /// interval and serves cached weights in between, so the hot path stays
+    /// cheap.
+    pub fn with_adaptive(mut self, controller: Arc<AdaptiveWeightController>) -> Self {
+        self.adaptive = Some(controller);
+        self
+    }
+
+    /// Borrow the attached adaptive weight controller, if any.
+    ///
+    /// The forwarding loop uses this handle to feed execution metrics
+    /// (forward success/failure, latency, KV hit ratio) back into the
+    /// controller after each request.
+    pub fn adaptive(&self) -> Option<&Arc<AdaptiveWeightController>> {
+        self.adaptive.as_ref()
+    }
+
+    /// Snapshot of the weights most recently used for scoring.
+    ///
+    /// With a controller attached this returns its cached effective weights —
+    /// exactly what the last `evaluate` call scored with — without triggering
+    /// a recomputation. Otherwise the static configured weights. Intended for
+    /// decision telemetry snapshots.
+    pub fn weight_snapshot(&self) -> StrategyWeights {
+        match &self.adaptive {
+            Some(ctl) => ctl.current_weights(),
+            None => self.weights.clone(),
+        }
+    }
+
+    /// The base weights in effect for this decision: adaptive when a
+    /// controller is attached, otherwise the static configured weights.
+    fn effective_base_weights(&self, meta: &MetadataStore) -> StrategyWeights {
+        match &self.adaptive {
+            Some(ctl) => ctl.effective_weights(meta),
+            None => self.weights.clone(),
         }
     }
 
@@ -132,8 +180,10 @@ impl RoutingStrategy for HybridStrategy {
         }
 
         // 2. Dynamic weight adjustment
+        //    Base weights: adaptive controller when attached, else static config.
+        let base = self.effective_base_weights(meta);
         let kv_available = self.kv.is_available(meta);
-        let mut weight_kv = if kv_available { self.weights.kv } else { 0.0 };
+        let mut weight_kv = if kv_available { base.kv } else { 0.0 };
 
         // Discount the load weight when any candidate's load metrics exceed the staleness threshold
         let mut load_stale = false;
@@ -146,11 +196,11 @@ impl RoutingStrategy for HybridStrategy {
             }
         }
         let mut weight_load = if load_stale {
-            self.weights.load * 0.3
+            base.load * 0.3
         } else {
-            self.weights.load
+            base.load
         };
-        let weight_topo = self.weights.topology;
+        let weight_topo = base.topology;
 
         // Normalize weights so the sum is 1.0
         let total = weight_kv + weight_load + weight_topo;

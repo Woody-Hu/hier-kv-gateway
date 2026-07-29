@@ -28,3 +28,10 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 # Optional: real NATS client used by the Dynamo connector.
 async-nats = { version = "0.38", optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "sglang_wire"
+harness = false
