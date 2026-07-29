@@ -89,18 +89,18 @@ impl MetadataStore {
         self.kv_index.kv_find_local_overlap(hashes, backend).await
     }
 
-    /// Local exact query (batched): returns the prefix overlap length of *all*
-    /// backends in a single round-trip to the RadixTree worker thread.
+    /// Local batched query: returns the prefix overlap length of *all*
+    /// backends in a single pass over the LocalCkf transposed bucket layout.
     ///
-    /// This is the batched counterpart of [`kv_find_local_overlap`] and is the
-    /// preferred entry point when scoring multiple candidate backends per
-    /// request (e.g. inside `KvAwareStrategy::evaluate`). See
-    /// `metadata_hot_path` bench for the speedup characterization.
-    pub async fn kv_find_all_local_overlap(
+    /// This is the preferred entry point when scoring multiple candidate
+    /// backends per request (e.g. inside `KvAwareStrategy::evaluate`). It
+    /// replaces the previous async RadixTree channel round-trip with a
+    /// synchronous, cache-friendly scan — no channel overhead.
+    pub fn kv_find_all_local_overlap(
         &self,
         hashes: &[u64],
     ) -> HashMap<BackendId, u32> {
-        self.kv_index.kv_find_all_local_overlap(hashes).await
+        self.kv_index.kv_find_all_local_overlap(hashes)
     }
 
     /// Cross-Region approximate query for a Region's prefix overlap on a hash sequence.
@@ -309,12 +309,14 @@ impl MetadataStore {
 
     /// Trigger ownership cleanup for a backend in the KV index (async).
     ///
-    /// Since `RadixTree::remove_backend` is async, this returns a future for the
-    /// caller to await on the appropriate runtime.
+    /// Clears both the LocalCkf lane (synchronous) and the RadixTree ownership
+    /// (async via channel). The returned future drives the RadixTree cleanup.
     pub fn kv_remove_backend(
         &self,
         backend: BackendId,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        // Synchronously clear the LocalCkf lane.
+        self.kv_index.local_ckf().unassign_lane(&backend);
         let radix = self.kv_index.radix().clone();
         async move {
             radix.remove_backend(backend).await;

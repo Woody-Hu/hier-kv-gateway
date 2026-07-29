@@ -24,6 +24,7 @@ use hier_kv_gateway_core::kv_event::KvCacheEvent;
 use hier_kv_gateway_metadata::ckf_consumer::{CkfConsumer, LANE_COUNT};
 use hier_kv_gateway_metadata::ckf_producer::CkfProducer;
 use hier_kv_gateway_metadata::cuckoo_filter::{try_insert, CkfSnapshot, PackedBucket, BUCKETS_PER_LANE};
+use hier_kv_gateway_metadata::local_ckf::LocalCkf;
 use hier_kv_gateway_metadata::radix_tree::RadixTree;
 
 // --------------------------------------------------------------------------
@@ -196,9 +197,67 @@ fn bench_ckf_estimate_overlap(c: &mut Criterion) {
     group.finish();
 }
 
+// --------------------------------------------------------------------------
+// LocalCkf benchmark: compare sync LocalCkf scan vs async RadixTree round-trip.
+// --------------------------------------------------------------------------
+
+/// Build a LocalCkf populated with `n_backends` backends, each owning the
+/// same `prefix_len`-long block-hash prefix.
+fn build_local_ckf(n_backends: usize, prefix_len: usize) -> (LocalCkf, Vec<BackendId>, Vec<u64>) {
+    let ckf = LocalCkf::new();
+    let region = RegionId::new("r1");
+    let prefix: Vec<u64> = (1..=prefix_len as u64).collect();
+
+    for i in 0..n_backends {
+        let b = BackendId::new(region.clone(), format!("inst-{i}"));
+        let lane = ckf.assign_lane(&b).expect("lane should be assigned");
+        for &h in &prefix {
+            ckf.insert(h, lane);
+        }
+    }
+    (ckf, Vec::new(), prefix)
+}
+
+fn bench_local_ckf_vs_radix(c: &mut Criterion) {
+    let mut group = c.benchmark_group("local_ckf_vs_radix");
+    group.sample_size(100);
+
+    for n_backends in [1usize, 5, 10, 16] {
+        let prefix_len = 16;
+
+        // RadixTree path (async, channel round-trip)
+        let (tree, _backends, prefix) = build_radix_tree(n_backends, prefix_len);
+        group.bench_with_input(
+            BenchmarkId::new("radix_find_all_matches", n_backends),
+            &n_backends,
+            |b, &_n| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                b.to_async(&rt).iter(|| async {
+                    let all = tree.find_all_matches(prefix.clone()).await;
+                    black_box(all);
+                });
+            },
+        );
+
+        // LocalCkf path (sync, cache-friendly transposed scan)
+        let (ckf, _backends, prefix) = build_local_ckf(n_backends, prefix_len);
+        group.bench_with_input(
+            BenchmarkId::new("local_ckf_estimate_all", n_backends),
+            &n_backends,
+            |b, &_n| {
+                b.iter(|| {
+                    let all = ckf.estimate_all_overlaps(black_box(&prefix));
+                    black_box(all);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default();
-    targets = bench_radix_find_matches, bench_ckf_lane_of, bench_ckf_estimate_overlap,
+    targets = bench_radix_find_matches, bench_ckf_lane_of, bench_ckf_estimate_overlap, bench_local_ckf_vs_radix,
 );
 criterion_main!(benches);

@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use tracing::{debug, warn};
 
 use hier_kv_gateway_cluster::gossip::GossipHandler;
@@ -139,22 +140,25 @@ impl MetadataGossipHandler {
         self.versions.members.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Snapshot the current backends + metrics into a JSON value for
-    /// `load_state` sync responses.
+    /// Snapshot the current backends + metrics into a compact binary payload
+    /// for `load_state` sync responses.
+    ///
+    /// Encodes `Vec<(backend_id_string, BackendMetrics)>` with postcard and
+    /// wraps the bytes in a base64 string carried inside a JSON `Value::String`.
     fn serialize_load_state(&self) -> serde_json::Value {
-        let entries: Vec<serde_json::Value> = self
+        let entries: Vec<(String, BackendMetrics)> = self
             .store
             .backends_all()
             .into_iter()
             .filter_map(|info| {
                 let metrics = self.store.load_get_metrics(&info.id)?;
-                Some(serde_json::json!({
-                    "backend_id": info.id.to_string(),
-                    "metrics": metrics,
-                }))
+                Some((info.id.to_string(), metrics))
             })
             .collect();
-        serde_json::Value::Array(entries)
+        let bytes = postcard::to_allocvec(&entries)
+            .expect("postcard serialization of load_state cannot fail");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        serde_json::Value::String(encoded)
     }
 
     /// Snapshot all known regions into a JSON value for `topology_state`
@@ -174,25 +178,32 @@ impl MetadataGossipHandler {
         serde_json::Value::Array(entries)
     }
 
-    /// Apply a `load_state` JSON payload produced by [`serialize_load_state`].
+    /// Apply a `load_state` payload produced by [`serialize_load_state`].
+    ///
+    /// Expects a JSON `Value::String` containing base64-encoded postcard bytes
+    /// of `Vec<(String, BackendMetrics)>`.
     fn apply_load_state(&self, value: &serde_json::Value) {
-        let Some(arr) = value.as_array() else {
-            debug!("load_state payload is not an array; ignoring");
+        let Some(encoded) = value.as_str() else {
+            debug!("load_state payload is not a string; ignoring");
             return;
         };
-        for entry in arr {
-            let Some(id_str) = entry.get("backend_id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(backend_id) = BackendId::parse(id_str) else {
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!(error = %e, "load_state: base64 decode failed, ignoring");
+                return;
+            }
+        };
+        let entries = match postcard::from_bytes::<Vec<(String, BackendMetrics)>>(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(error = %e, "load_state: postcard decode failed, ignoring");
+                return;
+            }
+        };
+        for (id_str, metrics) in entries {
+            let Some(backend_id) = BackendId::parse(&id_str) else {
                 debug!(id = %id_str, "load_state: malformed backend_id");
-                continue;
-            };
-            let Some(metrics) = entry
-                .get("metrics")
-                .and_then(|v| serde_json::from_value::<BackendMetrics>(v.clone()).ok())
-            else {
-                debug!(id = %id_str, "load_state: malformed metrics");
                 continue;
             };
             self.store.load_update(backend_id, metrics);
@@ -292,10 +303,14 @@ impl GossipHandler for MetadataGossipHandler {
     fn handle_metrics_broadcast(
         &self,
         region: &RegionId,
-        backends: &[(String, BackendMetrics)],
+        payload: &hier_kv_gateway_cluster::messages::LoadPayload,
     ) {
+        let Some(backends) = payload.decode() else {
+            debug!("metrics_broadcast: failed to decode payload, skipping");
+            return;
+        };
         let mut updated = 0u64;
-        for (id_str, metrics) in backends {
+        for (id_str, metrics) in &backends {
             let Some(backend_id) = BackendId::parse(id_str) else {
                 debug!(id = %id_str, "metrics_broadcast: malformed backend_id");
                 continue;
@@ -503,7 +518,10 @@ mod tests {
 
         h.handle_metrics_broadcast(
             &RegionId::new("r1"),
-            &[("r1/i1".to_string(), sample_metrics(1))],
+            &hier_kv_gateway_cluster::messages::LoadPayload::encode_full(&[(
+                "r1/i1".to_string(),
+                sample_metrics(1),
+            )]),
         );
         let d = h.current_meta_digest();
         assert_eq!(d.load_version, 1);
@@ -517,7 +535,10 @@ mod tests {
 
         h.handle_metrics_broadcast(
             &RegionId::new("r1"),
-            &[("r2/i1".to_string(), sample_metrics(1))],
+            &hier_kv_gateway_cluster::messages::LoadPayload::encode_full(&[(
+                "r2/i1".to_string(),
+                sample_metrics(1),
+            )]),
         );
         // Should not bump load_version because of region mismatch.
         let d = h.current_meta_digest();

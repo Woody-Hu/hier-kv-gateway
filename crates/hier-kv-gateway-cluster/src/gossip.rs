@@ -33,11 +33,10 @@ use rand::seq::SliceRandom;
 use hier_kv_gateway_core::config::ClusterConfig;
 use hier_kv_gateway_core::error::{HierKvGatewayError, Result};
 use hier_kv_gateway_core::ids::{InstanceId, PoolId, RegionId, SessionId};
-use hier_kv_gateway_core::metrics::BackendMetrics;
 use hier_kv_gateway_core::topology::LatencyEstimate;
 
 use crate::member::{now_unix_millis, ClusterMember, MemberList, MemberStatus};
-use crate::messages::{ClusterMessage, MetaDigest, MetaEntry};
+use crate::messages::{ClusterMessage, LoadPayload, MetaDigest, MetaEntry};
 use crate::transport::ClusterTransport;
 
 /// Fallback fanout used when a config supplies `0` (which would otherwise
@@ -66,10 +65,14 @@ pub trait GossipHandler: Send + Sync {
     fn apply_sync_response(&self, entries: &[MetaEntry]);
 
     /// Handles [`ClusterMessage::MetricsBroadcast`]: updates the local load statistics.
+    ///
+    /// The handler is responsible for calling [`LoadPayload::decode`] to obtain
+    /// the `Vec<(String, BackendMetrics)>` pairs. This indirection keeps the wire
+    /// format versioned and allows future delta-encoded payloads.
     fn handle_metrics_broadcast(
         &self,
         region: &RegionId,
-        backends: &[(String, BackendMetrics)],
+        payload: &LoadPayload,
     );
 
     /// Handles [`ClusterMessage::CkfBarrierSnapshot`]: installs the full snapshot into the local CKF Consumer.
@@ -129,7 +132,7 @@ impl GossipHandler for NoopGossipHandler {
     fn handle_metrics_broadcast(
         &self,
         _region: &RegionId,
-        _backends: &[(String, BackendMetrics)],
+        _payload: &LoadPayload,
     ) {
     }
 
@@ -436,9 +439,9 @@ impl GossipEngine {
             ClusterMessage::SyncResponse { entries } => {
                 self.handler.apply_sync_response(&entries);
             }
-            ClusterMessage::MetricsBroadcast { region, backends } => {
+            ClusterMessage::MetricsBroadcast { region, payload } => {
                 self.handler
-                    .handle_metrics_broadcast(&region, &backends);
+                    .handle_metrics_broadcast(&region, &payload);
             }
             ClusterMessage::CkfBarrierSnapshot {
                 pool,
@@ -768,8 +771,8 @@ async fn dispatch_message(
         ClusterMessage::SyncResponse { entries } => {
             handler.apply_sync_response(&entries);
         }
-        ClusterMessage::MetricsBroadcast { region, backends } => {
-            handler.handle_metrics_broadcast(&region, &backends);
+        ClusterMessage::MetricsBroadcast { region, payload } => {
+            handler.handle_metrics_broadcast(&region, &payload);
         }
         ClusterMessage::CkfBarrierSnapshot {
             pool,
@@ -815,6 +818,7 @@ mod tests {
     use super::*;
     use crate::messages::MetaKey;
     use hier_kv_gateway_core::ids::BackendInstanceId;
+    use hier_kv_gateway_core::metrics::BackendMetrics;
     use async_trait::async_trait;
     use std::sync::atomic::AtomicU64;
     use tokio::sync::Mutex;
@@ -874,12 +878,13 @@ mod tests {
         fn handle_metrics_broadcast(
             &self,
             _region: &RegionId,
-            backends: &[(String, BackendMetrics)],
+            payload: &crate::messages::LoadPayload,
         ) {
             self.metrics_calls.fetch_add(1, Ordering::Relaxed);
-            // Only record the last backend identifier, to avoid cloning the entire metrics in tests.
-            if let Some((id, _)) = backends.first() {
-                *self.last_metrics_backend.lock() = Some(id.clone());
+            if let Some(backends) = payload.decode() {
+                if let Some((id, _)) = backends.first() {
+                    *self.last_metrics_backend.lock() = Some(id.clone());
+                }
             }
         }
 
@@ -1096,7 +1101,10 @@ mod tests {
         };
         let msg = ClusterMessage::MetricsBroadcast {
             region: RegionId::new("r1"),
-            backends: vec![("b1".to_string(), metrics)],
+            payload: crate::messages::LoadPayload::encode_full(&[(
+                "b1".to_string(),
+                metrics,
+            )]),
         };
         engine.handle_message(msg).await;
         assert_eq!(
@@ -1193,7 +1201,10 @@ mod tests {
         engine
             .handle_message(ClusterMessage::MetricsBroadcast {
                 region: RegionId::new("r"),
-                backends: vec![("b".to_string(), metrics.clone())],
+                payload: crate::messages::LoadPayload::encode_full(&[(
+                    "b".to_string(),
+                    metrics.clone(),
+                )]),
             })
             .await;
 

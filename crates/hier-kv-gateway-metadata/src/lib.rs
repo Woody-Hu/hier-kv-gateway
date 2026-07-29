@@ -12,7 +12,8 @@
 //! - [`cuckoo_filter`]: Cuckoo Filter primitives, used for cross-Region approximate membership.
 //! - [`ckf_producer`]: one local CKF producer per pool.
 //! - [`ckf_consumer`]: transposed-layout CKF consumer, hosting multiple Region lanes.
-//! - [`kv_index`]: unified KV index interface, combining RadixTree and CkfConsumer.
+//! - [`local_ckf`]: local per-backend CKF projection (transposed), serves cache-friendly batch queries.
+//! - [`kv_index`]: unified KV index interface, combining RadixTree, LocalCkf and CkfConsumer.
 //! - [`model_registry`]: model registry.
 //! - [`load_stats`]: backend load statistics and sliding window.
 //! - [`topology_graph`]: Region topology and latency matrix.
@@ -23,6 +24,7 @@ pub mod radix_tree;
 pub mod cuckoo_filter;
 pub mod ckf_consumer;
 pub mod ckf_producer;
+pub mod local_ckf;
 pub mod kv_index;
 pub mod model_registry;
 pub mod load_stats;

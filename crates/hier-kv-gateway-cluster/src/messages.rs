@@ -13,11 +13,60 @@
 //! to maintain stable compatibility across multiple transport serialization formats
 //! such as JSON / msgpack.
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use hier_kv_gateway_core::ids::{InstanceId, PoolId, RegionId, SessionId};
 use hier_kv_gateway_core::metrics::BackendMetrics;
 use hier_kv_gateway_core::topology::LatencyEstimate;
+
+/// Compact payload for backend load metrics.
+///
+/// Encodes `Vec<(backend_id_string, BackendMetrics)>` using postcard (binary)
+/// and wraps it in a versioned envelope so future delta-encoded variants can
+/// be added without breaking older peers.
+///
+/// Wire format in JSON: `{"v": 1, "data": "<base64-postcard>"}`
+/// Future delta variant: `{"v": 2, "data": "<base64-postcard-delta>"}`
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LoadPayload {
+    /// Encoding version. 1 = full postcard payload.
+    pub v: u8,
+    /// Base64-encoded postcard bytes of `Vec<(String, BackendMetrics)>`.
+    pub data: String,
+}
+
+impl LoadPayload {
+    /// Encoding version for the current full-payload format.
+    pub const VERSION_FULL: u8 = 1;
+
+    /// Encode a list of (backend_id, metrics) into a compact `LoadPayload`.
+    pub fn encode_full(backends: &[(String, BackendMetrics)]) -> Self {
+        let bytes = postcard::to_allocvec(backends)
+            .expect("postcard serialization of BackendMetrics cannot fail");
+        Self {
+            v: Self::VERSION_FULL,
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        }
+    }
+
+    /// Decode the payload back into `Vec<(String, BackendMetrics)>`.
+    ///
+    /// Returns `None` if the version is unknown or decoding fails, allowing
+    /// the receiver to gracefully skip unsupported payloads.
+    pub fn decode(&self) -> Option<Vec<(String, BackendMetrics)>> {
+        match self.v {
+            Self::VERSION_FULL => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&self.data)
+                    .ok()?;
+                postcard::from_bytes::<Vec<(String, BackendMetrics)>>(&bytes).ok()
+            }
+            // Future delta variant would go here.
+            _ => None,
+        }
+    }
+}
 
 /// Unified cluster message envelope.
 ///
@@ -105,12 +154,15 @@ pub enum ClusterMessage {
     },
     /// Backend load metrics broadcast.
     ///
-    /// Each item in `backends` is `(backend identifier string, metrics snapshot)`.
+    /// `payload` is a compact binary-encoded [`LoadPayload`] (versioned envelope +
+    /// base64-wrapped postcard bytes) so peers that don't understand the version
+    /// can skip it gracefully. The [`GossipHandler::handle_metrics_broadcast`]
+    /// implementation decodes it back into `Vec<(String, BackendMetrics)>`.
     MetricsBroadcast {
         /// Region the metrics belong to.
         region: RegionId,
-        /// Latest metrics for multiple backends in this Region.
-        backends: Vec<(String, BackendMetrics)>,
+        /// Compact payload of `(backend_id, metrics)` pairs.
+        payload: LoadPayload,
     },
     /// Cross-Region topology latency update.
     ///

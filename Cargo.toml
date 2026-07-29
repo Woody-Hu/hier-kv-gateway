@@ -47,5 +47,7 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+postcard = { version = "1", features = ["alloc"] }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 redis = { version = "0.27", features = ["tokio-comp"] }
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
