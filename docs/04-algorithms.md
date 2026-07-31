@@ -576,22 +576,42 @@ struct ScoredBackend {
 ```
 对每个候选 backend b:
     m = LoadStats.get_metrics(b)
-    
-    load_cost = w_req  * m.active_requests
-              + w_queue * m.queue_depth
-              + w_lat   * (m.p99_latency / 100)
-              + w_gpu   * m.gpu_utilization
-              + w_kv    * m.kv_cache_usage
-    
+
+    # token-budget 项（保守上界，详见 7.4.1）
+    req_decode_blocks = ceil(ctx.estimated_output_tokens / ctx.block_size)   # 本请求将占用的 decode 块
+    projected_decode  = m.active_decode_blocks + req_decode_blocks           # 落在此 backend 后的 decode 压力
+    prefill_pressure  = m.active_prefill_tokens
+
+    load_cost = w_req    * m.active_requests
+              + w_queue  * m.queue_depth
+              + w_lat    * (m.p99_latency / 100)
+              + w_gpu    * m.gpu_utilization
+              + w_kv     * m.kv_cache_usage
+              + w_decode * projected_decode        # 投影 decode 压力
+              + w_prefill * prefill_pressure        # 当前 prefill 压力
+
     容量检查: if available_capacity <= 0: 排除
-    
+
     cost  = load_cost
     score = 1.0 / (1.0 + load_cost)
 ```
 
-**默认权重**：`w_req=1.0, w_queue=2.0, w_lat=1.5, w_gpu=0.5, w_kv=0.8`
+**默认权重**：`w_req=1.0, w_queue=1.0, w_lat=0.01, w_gpu=1.0, w_kv=1.0, w_decode=0.02, w_prefill=0.001`
+
+> 设 `w_decode = 0` 且 `w_prefill = 0` 即可逐字节复现改动前的 count-blind 成本（向后兼容开关）。
 
 **滑动窗口**：60 秒窗口，1 秒采样间隔，p50/p99 用近似算法。
+
+#### 7.4.1 Token-budget 感知（投影 decode / prefill 压力）
+
+改动前 `load_cost` 仅按 `active_requests` 计数，对生成长度**无感**：持有 1 个 4096-token 请求的 backend 会被判为比持有 4 个 16-token 请求的 backend「更空闲」，尽管前者占用约 64× 的 decode 容量。`RoutingContext::estimated_output_tokens` 与 `BackendMetrics::active_prefill_tokens` 此前已被采集但未被任何策略消费。
+
+新增两项闭合该缺口：
+
+- **投影 decode 压力**（`w_decode`）：backend 当前 `active_decode_blocks` *加上* 本请求的输出预算会新增的块数。`estimated_output_tokens` 源自客户端 `max_tokens`（生成的硬上界），因此投影**永不低估** decode 占用——遵循业界对输出长度估计采用保守上界而非点估计的结论（避免饥饿与热点）。
+- **Prefill 压力**（`w_prefill`）：backend 的 `active_prefill_tokens`，一个此前已采集但未入软成本项的信号。不与本请求的 prompt 投影合并，因为 load 策略拿不到 KV overlap（那是 KV 策略的领域）；保持两策略独立以维护 Hybrid 归一化语义。
+
+**验证**：见 [token-aware-load.md](benchmarks/token-aware-load.md)。在真实 `MetadataStore` + `RoutingEngine` 的离散事件回放（180 请求混合短/长生成、含完成事件）下，token-aware 相对 count-blind 基线：decode 压力跨 backend 的 CoV 下降 **31.8%**（0.070 → 0.048），峰值 690 → 651 blocks（clairvoyant 下界 616.7）；n=20 候选时路由延迟与基线**统计不可区分**（baseline ≈ 40 µs、token_aware ≈ 39 µs，多次运行 median 互有高低，开销低于测量噪声底），远低于 10% 阈值。两项均满足引入判据（CoV 改善 ≥15%、延迟开销 <10%）。
 
 ### 7.5 Topology Aware（拓扑感知路由）
 

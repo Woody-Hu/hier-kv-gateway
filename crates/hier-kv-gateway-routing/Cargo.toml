@@ -29,3 +29,7 @@ harness = false
 [[bench]]
 name = "adaptive_weights"
 harness = false
+
+[[bench]]
+name = "token_aware_load"
+harness = false
