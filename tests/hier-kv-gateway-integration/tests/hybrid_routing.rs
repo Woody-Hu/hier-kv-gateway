@@ -137,6 +137,7 @@ async fn hybrid_routing_prefers_backend_with_higher_kv_overlap() {
     let ctx = RoutingContext {
         request_id: None,
         session_id: None,
+        tenant_id: None,
         model_name: Some("test-model".to_string()),
         token_ids: vec![1, 2, 3, 4, 5],
         block_hashes: vec![1, 2, 3, 4, 5],
@@ -232,6 +233,7 @@ async fn hybrid_routing_session_affinity_reuses_previous_backend() {
     let ctx_first = RoutingContext {
         request_id: None,
         session_id: Some(session_id.clone()),
+        tenant_id: None,
         model_name: Some("m".to_string()),
         token_ids: vec![1, 2, 3, 4, 5],
         block_hashes: vec![1, 2, 3, 4, 5],
@@ -249,6 +251,7 @@ async fn hybrid_routing_session_affinity_reuses_previous_backend() {
     let ctx_second = RoutingContext {
         request_id: None,
         session_id: Some(session_id.clone()),
+        tenant_id: None,
         model_name: Some("m".to_string()),
         token_ids: vec![10, 20, 30],
         block_hashes: vec![10, 20, 30],

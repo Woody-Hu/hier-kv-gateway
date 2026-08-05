@@ -324,6 +324,7 @@ async fn replay(label: &'static str, workload: &[WorkloadReq]) -> ReplayReport {
         let ctx = RoutingContext {
             request_id: None,
             session_id: None, // no session affinity — force the scoring path
+            tenant_id: None,
             model_name: Some(MODEL_NAME.to_string()),
             token_ids: Vec::new(),
             block_hashes: Vec::new(), // no KV overlap — isolate the load signal

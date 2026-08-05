@@ -13,4 +13,5 @@ pub mod ids;
 pub mod kv_event;
 pub mod metrics;
 pub mod request;
+pub mod tenant;
 pub mod topology;

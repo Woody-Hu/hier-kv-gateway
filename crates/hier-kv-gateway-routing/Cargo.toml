@@ -33,3 +33,7 @@ harness = false
 [[bench]]
 name = "token_aware_load"
 harness = false
+
+[[bench]]
+name = "tenant_scheduler"
+harness = false

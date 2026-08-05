@@ -96,6 +96,7 @@ fn ctx_with_hashes(hashes: Vec<u64>, model: &str) -> RoutingContext {
     RoutingContext {
         request_id: None,
         session_id: None,
+        tenant_id: None,
         model_name: Some(model.to_string()),
         token_ids: hashes.iter().map(|h| *h as u32).collect(),
         block_hashes: hashes,

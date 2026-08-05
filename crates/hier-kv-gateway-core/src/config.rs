@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{BackendType, Endpoint, Quantization};
 use crate::error::{HierKvGatewayError, Result};
 use crate::ids::{InstanceId, RegionId, RegionTier};
+use crate::tenant::TenantPriority;
 
 /// Top-level gateway configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,6 +38,9 @@ pub struct GatewayConfig {
     /// Configured backend list; empty by default.
     #[serde(default)]
     pub backends: Vec<BackendConfig>,
+    /// Multi-tenant scheduling configuration.
+    #[serde(default)]
+    pub tenant: TenantConfig,
 }
 
 /// Region configuration.
@@ -340,6 +344,68 @@ pub struct BackendConfig {
     pub kv_block_size: u32,
     /// Optional quantization method, used only for descriptive purposes on the configuration side.
     pub quantization: Option<Quantization>,
+}
+
+/// Multi-tenant scheduling configuration.
+///
+/// Controls per-tenant rate limits, priority-based admission, and fair
+/// queuing when the system is saturated.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TenantConfig {
+    /// Master switch for tenant-aware scheduling. When `false`, every
+    /// request is treated as belonging to the implicit default tenant and
+    /// no rate limiting or priority-based admission is applied.
+    pub enabled: bool,
+    /// Default maximum requests per second for tenants without an explicit
+    /// per-tenant override. `None` means unlimited.
+    pub default_max_rps: Option<f64>,
+    /// Default maximum concurrent (in-flight) requests for tenants without
+    /// an explicit per-tenant override. `None` means unlimited.
+    pub default_max_concurrent: Option<u32>,
+    /// Saturation threshold (0.0–1.0). When the fraction of backend capacity
+    /// in use exceeds this value, the scheduler activates priority-based
+    /// admission: Premium tenants get their reserved fraction first, then
+    /// Normal, then Background.
+    pub saturation_threshold: f64,
+    /// Per-tenant quota overrides. Each entry defines the limits for one
+    /// tenant; tenants not listed here receive the defaults.
+    #[serde(default)]
+    pub tenants: Vec<TenantQuotaConfig>,
+}
+
+impl Default for TenantConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_max_rps: None,
+            default_max_concurrent: None,
+            saturation_threshold: 0.8,
+            tenants: Vec::new(),
+        }
+    }
+}
+
+/// Per-tenant quota entry in the gateway configuration file.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TenantQuotaConfig {
+    /// Tenant identifier (matches the `X-Tenant-Id` header).
+    pub id: String,
+    /// Priority level. Defaults to `"normal"`.
+    #[serde(default = "default_tenant_priority")]
+    pub priority: TenantPriority,
+    /// Maximum requests per second. Overrides `default_max_rps`.
+    pub max_rps: Option<f64>,
+    /// Maximum concurrent requests. Overrides `default_max_concurrent`.
+    pub max_concurrent: Option<u32>,
+    /// Reserved fraction of total backend capacity (0.0–1.0). Only
+    /// meaningful for `Premium` tenants; ignored for others.
+    #[serde(default)]
+    pub reserved_capacity_fraction: f64,
+}
+
+fn default_tenant_priority() -> TenantPriority {
+    TenantPriority::Normal
 }
 
 /// Load [`GatewayConfig`] from a TOML file.
