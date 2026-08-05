@@ -405,6 +405,55 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+/// Tenant identifier.
+///
+/// Each tenant (organization, team, customer) is identified by a unique string.
+/// Extracted from the HTTP request header `X-Tenant-Id` or similar mechanism.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TenantId(pub Arc<str>);
+
+impl TenantId {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(Arc::from(s.into()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq for TenantId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ref() == other.0.as_ref()
+    }
+}
+
+impl Eq for TenantId {}
+
+impl Hash for TenantId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.as_ref().hash(state);
+    }
+}
+
+impl From<String> for TenantId {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<&str> for TenantId {
+    fn from(s: &str) -> Self {
+        Self::new(s.to_string())
+    }
+}
+
+impl std::fmt::Display for TenantId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// Worker identifier and its data-parallel rank.
 ///
 /// `worker_id` identifies the worker globally; `dp_rank` is the worker's rank in

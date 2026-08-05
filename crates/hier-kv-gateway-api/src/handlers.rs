@@ -169,6 +169,7 @@ pub async fn chat_completions(
     let ctx = RoutingContext {
         request_id: Some(request_id.clone()),
         session_id: session_id.clone(),
+        tenant_id: None,
         model_name: Some(model_name.clone()),
         token_ids: inference.token_ids.clone(),
         block_hashes,

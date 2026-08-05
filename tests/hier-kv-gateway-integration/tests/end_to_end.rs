@@ -180,6 +180,7 @@ async fn end_to_end_discover_route_forward() {
     let ctx = hier_kv_gateway_core::request::RoutingContext {
         request_id: Some(request.request_id.clone()),
         session_id: None,
+        tenant_id: None,
         model_name: Some(request.model.clone()),
         token_ids: request.token_ids.clone(),
         block_hashes: hier_kv_gateway_core::kv_event::compute_block_hashes(

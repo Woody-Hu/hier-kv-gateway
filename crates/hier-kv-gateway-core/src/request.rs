@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BackendId, RequestId, SessionId};
+use crate::ids::{BackendId, RequestId, SessionId, TenantId};
 
 /// A chat message.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,6 +121,8 @@ pub struct RoutingContext {
     pub request_id: Option<RequestId>,
     /// Session identifier, used for session affinity.
     pub session_id: Option<SessionId>,
+    /// Tenant identifier, used for multi-tenant admission control.
+    pub tenant_id: Option<TenantId>,
     /// Target model name.
     pub model_name: Option<String>,
     /// Tokenized token sequence.

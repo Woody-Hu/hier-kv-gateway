@@ -26,3 +26,4 @@ pub mod adaptive;
 pub mod prefix_history;
 pub mod degradation;
 pub mod engine;
+pub mod tenant_scheduler;
