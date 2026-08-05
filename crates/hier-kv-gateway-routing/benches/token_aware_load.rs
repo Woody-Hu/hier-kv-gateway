@@ -125,6 +125,7 @@ fn build_engine(load: LoadAwareStrategy) -> RoutingEngine {
         kv: 0.0,
         load: 1.0,
         topology: 0.0,
+        cost: 0.0,
     };
     let hybrid = HybridStrategy::new(kv, model, Box::new(load), topology, weights, 0.0);
     RoutingEngine::new(hybrid, Duration::from_secs(300), 3, RegionId::new("cloud-cn-beijing"))
@@ -144,16 +145,10 @@ fn token_aware_load() -> LoadAwareStrategy {
 
 fn ctx_with_output_budget(estimated_output_tokens: u32) -> RoutingContext {
     RoutingContext {
-        request_id: None,
-        session_id: None,
         model_name: Some(MODEL_NAME.to_string()),
-        token_ids: Vec::new(),
-        block_hashes: Vec::new(),
         block_size: 16,
-        lora_name: None,
-        cache_namespace: None,
         estimated_output_tokens,
-        requires_tool_calling: false,
+        ..RoutingContext::default()
     }
 }
 

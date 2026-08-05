@@ -37,3 +37,7 @@ harness = false
 [[bench]]
 name = "tenant_scheduler"
 harness = false
+
+[[bench]]
+name = "cost_tier_plugins"
+harness = false

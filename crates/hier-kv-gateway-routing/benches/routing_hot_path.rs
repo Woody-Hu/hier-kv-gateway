@@ -164,6 +164,7 @@ fn build_hbrid(self_region: RegionId) -> HybridStrategy {
         kv: 0.35,
         load: 0.30,
         topology: 0.20,
+        cost: 0.0,
     };
     HybridStrategy::new(kv, model, load, topology, weights, 0.0)
 }
@@ -175,16 +176,13 @@ fn build_routing_engine(self_region: RegionId) -> RoutingEngine {
 
 fn build_routing_ctx(prefix: Vec<u64>) -> RoutingContext {
     RoutingContext {
-        request_id: None,
-        session_id: None, // force the hybrid path, not session affinity
+        // force the hybrid path, not session affinity
+        session_id: None,
         model_name: Some(MODEL_NAME.to_string()),
-        token_ids: Vec::new(),
         block_hashes: prefix,
         block_size: 16,
-        lora_name: None,
-        cache_namespace: None,
         estimated_output_tokens: 128,
-        requires_tool_calling: false,
+        ..RoutingContext::default()
     }
 }
 

@@ -20,12 +20,19 @@ parking_lot = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 criterion = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "decision_events"
+harness = false
+
+[[bench]]
+name = "request_coalescer"
 harness = false

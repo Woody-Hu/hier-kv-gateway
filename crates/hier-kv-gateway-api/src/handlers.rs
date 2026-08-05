@@ -39,6 +39,7 @@ use hier_kv_gateway_metadata::store::MetadataStore;
 use hier_kv_gateway_routing::engine::{RouteDecision, RoutingEngine};
 use hier_kv_gateway_routing::strategy::RoutingStrategy;
 
+use crate::coalescer::{request_key, CoalesceError, CoalescedResponse, RequestCoalescer};
 use crate::openai_types::{
     OpenAIChatChunk, OpenAIChatRequest, OpenAIChatResponse, OpenAIModelList,
 };
@@ -87,6 +88,12 @@ pub struct AppState {
     pub gateway_instance: String,
     /// Gateway region stamped onto every decision event.
     pub gateway_region: String,
+    /// Single-flight request coalescer for non-streaming chat completions.
+    ///
+    /// When `coalescer.enabled()` is `true`, concurrent identical non-streaming
+    /// requests are collapsed into a single forward; waiters receive a clone
+    /// of the leader's response. Streaming requests always bypass coalescing.
+    pub coalescer: RequestCoalescer,
 }
 
 impl std::fmt::Debug for AppState {
@@ -145,6 +152,13 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenAIChatRequest>,
 ) -> Response {
+    // Single-flight coalescing: collapse concurrent identical non-streaming
+    // requests into one forward. Streaming requests always bypass (sharing
+    // an SSE stream transparently would require buffering+replaying).
+    if !req.stream && state.coalescer.enabled() {
+        return coalesced_chat_completions(state, req).await;
+    }
+
     let total_start = std::time::Instant::now();
     let stream_mode = req.stream;
     let session_id = req.session.as_ref().map(SessionId::new);
@@ -286,6 +300,303 @@ pub async fn chat_completions(
             error_response(StatusCode::BAD_GATEWAY, &e)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Coalesced (single-flight) non-streaming path
+// ---------------------------------------------------------------------------
+
+/// Non-streaming chat completions via the single-flight coalescer.
+///
+/// The first request for a given semantic key (the *leader*) runs the full
+/// route → forward → aggregate pipeline inside the coalescer's producer.
+/// Concurrent identical requests (waiters) attach to the leader's shared
+/// future and receive a clone of the same [`CoalescedResponse`].
+///
+/// Decision events are emitted only by the leader (inside the producer);
+/// waiters never route, so they have no decision to report.
+async fn coalesced_chat_completions(
+    state: Arc<AppState>,
+    req: OpenAIChatRequest,
+) -> Response {
+    let key = request_key(&req);
+    let coalescer = state.coalescer.clone();
+
+    let result = coalescer
+        .coalesce(key, || {
+            let state = state.clone();
+            let req = req.clone();
+            async move { run_coalesced_forward(state, req).await }
+        })
+        .await;
+
+    match result {
+        Ok(coalesced) => build_coalesced_response(coalesced),
+        Err(e) => {
+            error!(error = %e, "coalesced forward failed");
+            let err = HierKvGatewayError::ConnectorError(e.to_string());
+            error_response(StatusCode::BAD_GATEWAY, &err)
+        }
+    }
+}
+
+/// Leader-side producer: route → forward → aggregate → serialize.
+///
+/// Runs exactly once per coalesced key. Emits the decision event before
+/// returning. The serialized [`OpenAIChatResponse`] JSON becomes the body
+/// shared with all waiters.
+async fn run_coalesced_forward(
+    state: Arc<AppState>,
+    req: OpenAIChatRequest,
+) -> Result<CoalescedResponse, CoalesceError> {
+    let total_start = std::time::Instant::now();
+    let session_id = req.session.as_ref().map(SessionId::new);
+    let model_name = req.model.clone();
+
+    let inference: InferenceRequest = req.to_inference_request();
+    let request_id = inference.request_id.clone();
+
+    let block_hashes = if !inference.token_ids.is_empty() {
+        compute_block_hashes(&BlockHashInput {
+            tokens: &inference.token_ids,
+            kv_block_size: state.routing_config.kv_block_size,
+            cache_namespace: None,
+            lora_name: inference.lora_name.as_deref(),
+        })
+    } else {
+        Vec::new()
+    };
+    let prompt_blocks = block_hashes.len() as u32;
+    let ctx = RoutingContext {
+        request_id: Some(request_id.clone()),
+        session_id: session_id.clone(),
+        tenant_id: None,
+        model_name: Some(model_name.clone()),
+        token_ids: inference.token_ids.clone(),
+        block_hashes,
+        block_size: state.routing_config.kv_block_size,
+        lora_name: inference.lora_name.clone(),
+        cache_namespace: None,
+        estimated_output_tokens: inference.max_tokens,
+        requires_tool_calling: !inference.tools.is_empty(),
+    };
+
+    let max_attempts = state.routing_config.max_retries.saturating_add(1) as usize;
+    let route_start = std::time::Instant::now();
+    let routed = state
+        .routing
+        .route_candidates(&ctx, &state.metadata, max_attempts)
+        .await;
+    let routing_latency_us = route_start.elapsed().as_micros() as u64;
+    let decisions = match routed {
+        Ok(d) if !d.is_empty() => d,
+        Ok(_) => {
+            let e = HierKvGatewayError::BackendUnavailable;
+            error!(request_id = %request_id, error = %e, "coalesced routing failed");
+            emit_decision_event(DecisionEventParams {
+                state: &state,
+                request_id: &request_id,
+                model: &model_name,
+                session_id: session_id.as_ref(),
+                decisions: &[],
+                attempts: Vec::new(),
+                selected: None,
+                prompt_blocks,
+                routing_latency_us,
+                total_start,
+                outcome: DecisionOutcome::RoutingFailed,
+            });
+            return Err(CoalesceError::from(e.to_string()));
+        }
+        Err(e) => {
+            error!(request_id = %request_id, error = %e, "coalesced routing failed");
+            emit_decision_event(DecisionEventParams {
+                state: &state,
+                request_id: &request_id,
+                model: &model_name,
+                session_id: session_id.as_ref(),
+                decisions: &[],
+                attempts: Vec::new(),
+                selected: None,
+                prompt_blocks,
+                routing_latency_us,
+                total_start,
+                outcome: DecisionOutcome::RoutingFailed,
+            });
+            return Err(CoalesceError::from(e.to_string()));
+        }
+    };
+
+    let mut attempts: Vec<ForwardAttempt> = Vec::with_capacity(decisions.len());
+    match forward_with_retries(
+        &state,
+        &decisions,
+        &inference,
+        &request_id,
+        prompt_blocks,
+        &mut attempts,
+    )
+    .await
+    {
+        Ok((chunk_stream, routing_meta)) => {
+            debug!(
+                request_id = %request_id,
+                backend = %routing_meta.backend,
+                "coalesced forward succeeded"
+            );
+            emit_decision_event(DecisionEventParams {
+                state: &state,
+                request_id: &request_id,
+                model: &model_name,
+                session_id: session_id.as_ref(),
+                decisions: &decisions,
+                attempts,
+                selected: Some(&routing_meta),
+                prompt_blocks,
+                routing_latency_us,
+                total_start,
+                outcome: DecisionOutcome::Success,
+            });
+
+            // Aggregate the chunk stream into a complete OpenAIChatResponse.
+            match aggregate_chunk_stream(
+                chunk_stream,
+                request_id.as_str(),
+                &model_name,
+                &inference,
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let body = serde_json::to_vec(&resp)
+                        .map_err(|e| CoalesceError::from(e.to_string()))?;
+                    Ok(CoalescedResponse {
+                        status: 200,
+                        body: Arc::from(body),
+                        backend: routing_meta.backend,
+                        strategy: routing_meta.strategy,
+                        kv_overlap: routing_meta.kv_overlap,
+                    })
+                }
+                Err((_code, message)) => {
+                    // Backend returned an error chunk mid-stream.
+                    let err =
+                        HierKvGatewayError::ConnectorError(format!("backend error: {}", message));
+                    Err(CoalesceError::from(err.to_string()))
+                }
+            }
+        }
+        Err(e) => {
+            error!(request_id = %request_id, error = %e, "coalesced forwarding failed");
+            emit_decision_event(DecisionEventParams {
+                state: &state,
+                request_id: &request_id,
+                model: &model_name,
+                session_id: session_id.as_ref(),
+                decisions: &decisions,
+                attempts,
+                selected: None,
+                prompt_blocks,
+                routing_latency_us,
+                total_start,
+                outcome: DecisionOutcome::AllCandidatesFailed,
+            });
+            Err(CoalesceError::from(e.to_string()))
+        }
+    }
+}
+
+/// Build the HTTP response from a coalesced result.
+///
+/// Sets the standard routing headers plus `X-Hier-KV-Gateway-Coalesced: true`
+/// so clients can tell the response may have been served from an in-flight
+/// leader's result rather than a fresh forward.
+fn build_coalesced_response(coalesced: CoalescedResponse) -> Response {
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&coalesced.backend) {
+        headers.insert("X-Hier-KV-Gateway-Backend", v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&coalesced.strategy) {
+        headers.insert("X-Hier-KV-Gateway-Strategy", v);
+    }
+    let overlap = coalesced.kv_overlap.to_string();
+    if let Ok(v) = HeaderValue::from_str(&overlap) {
+        headers.insert("X-Hier-KV-Gateway-KV-Overlap", v);
+    }
+    headers.insert(
+        "X-Hier-KV-Gateway-Coalesced",
+        HeaderValue::from_static("true"),
+    );
+    let status = StatusCode::from_u16(coalesced.status)
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    // Build the response manually: `Arc<[u8]>` is not an `IntoResponse` body
+    // on its own, so we convert to `Vec<u8>` and wrap in `axum::body::Body`.
+    // This is a per-waiter copy of the (small, already-serialized) JSON body;
+    // the expensive forward has already been deduplicated, so this copy is
+    // negligible relative to the saved downstream round-trip.
+    let mut resp = Response::new(axum::body::Body::from(coalesced.body.to_vec()));
+    *resp.status_mut() = status;
+    *resp.headers_mut() = headers;
+    resp
+}
+
+/// Aggregate a chunk stream into a complete [`OpenAIChatResponse`].
+///
+/// Shared by both the direct non-streaming path and the coalesced producer.
+/// Returns `Err((code, message))` when the stream contained an error chunk.
+async fn aggregate_chunk_stream(
+    chunk_stream: BoxStream<'static, InferenceChunk>,
+    request_id: &str,
+    model: &str,
+    inference: &InferenceRequest,
+) -> Result<OpenAIChatResponse, (u16, String)> {
+    let mut content = String::new();
+    let mut finish_reason: Option<String> = None;
+    let mut completion_tokens: u64 = 0;
+
+    let mut stream = chunk_stream;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            InferenceChunk::Delta {
+                text,
+                finish_reason: fr,
+            } => {
+                if !text.is_empty() {
+                    content.push_str(&text);
+                    completion_tokens += approx_token_count(&text);
+                }
+                if let Some(reason) = fr {
+                    finish_reason = Some(reason);
+                }
+            }
+            InferenceChunk::ToolCall { .. } => {}
+            InferenceChunk::Done { .. } => {
+                if finish_reason.is_none() {
+                    finish_reason = Some("stop".to_string());
+                }
+                break;
+            }
+            InferenceChunk::Error { code, message } => {
+                return Err((code, message));
+            }
+        }
+    }
+
+    let prompt_chars: usize = inference
+        .messages
+        .iter()
+        .map(|m| m.content.chars().count())
+        .sum();
+    let prompt_tokens = (prompt_chars as f64 / 4.0).ceil() as u64;
+
+    Ok(OpenAIChatResponse::from_text(
+        request_id,
+        model,
+        content,
+        finish_reason,
+        prompt_tokens,
+        completion_tokens,
+    ))
 }
 
 /// Inputs for building one [`DecisionEvent`]; see [`emit_decision_event`].
@@ -636,69 +947,18 @@ async fn build_non_stream_response(
     routing_meta: &RoutingMeta,
     inference: &InferenceRequest,
 ) -> Response {
-    let mut content = String::new();
-    let mut finish_reason: Option<String> = None;
-    let mut completion_tokens: u64 = 0;
-    let mut error_chunk: Option<(u16, String)> = None;
-
-    let mut stream = chunk_stream;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            InferenceChunk::Delta {
-                text,
-                finish_reason: fr,
-            } => {
-                if !text.is_empty() {
-                    content.push_str(&text);
-                    // Rough estimate: count tokens by character count for incremental text (fallback when no tokenizer is available)
-                    completion_tokens += approx_token_count(&text);
-                }
-                if let Some(reason) = fr {
-                    finish_reason = Some(reason);
-                }
-            }
-            InferenceChunk::ToolCall { .. } => {
-                // tool_calls are not processed during non-streaming aggregation
-            }
-            InferenceChunk::Done { .. } => {
-                if finish_reason.is_none() {
-                    finish_reason = Some("stop".to_string());
-                }
-                break;
-            }
-            InferenceChunk::Error { code, message } => {
-                error_chunk = Some((code, message));
-                break;
-            }
+    match aggregate_chunk_stream(chunk_stream, request_id.as_str(), model, inference).await {
+        Ok(resp) => {
+            let mut headers = HeaderMap::new();
+            routing_meta.apply_to_headers(&mut headers);
+            (headers, Json(resp)).into_response()
+        }
+        Err((code, message)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+            let err = HierKvGatewayError::ConnectorError(format!("backend error: {}", message));
+            error_response(status, &err)
         }
     }
-
-    if let Some((code, message)) = error_chunk {
-        let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
-        let err = HierKvGatewayError::ConnectorError(format!("backend error: {}", message));
-        return error_response(status, &err);
-    }
-
-    // Estimate prompt_tokens: use the rough ratio of total message characters / 4
-    let prompt_chars: usize = inference
-        .messages
-        .iter()
-        .map(|m| m.content.chars().count())
-        .sum();
-    let prompt_tokens = (prompt_chars as f64 / 4.0).ceil() as u64;
-
-    let resp = OpenAIChatResponse::from_text(
-        request_id.as_str(),
-        model,
-        content,
-        finish_reason,
-        prompt_tokens,
-        completion_tokens,
-    );
-
-    let mut headers = HeaderMap::new();
-    routing_meta.apply_to_headers(&mut headers);
-    (headers, Json(resp)).into_response()
 }
 
 /// Use a rough character count -> token count estimate.
@@ -896,6 +1156,7 @@ pub async fn cluster_peers(
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use hier_kv_gateway_core::coalescing::CoalescingConfig;
     use hier_kv_gateway_core::config::{StrategyType, StrategyWeights};
     use hier_kv_gateway_routing::hybrid::HybridStrategy;
     use hier_kv_gateway_routing::kv_aware::KvAwareStrategy;
@@ -907,7 +1168,9 @@ pub(crate) mod test_support {
     /// Build an AppState using the default hybrid strategy, only for unit tests.
     ///
     /// Returns the bare state (not `Arc`-wrapped) so tests can adjust fields
-    /// (retry policy, breakers, connectors) before sharing it.
+    /// (retry policy, breakers, connectors) before sharing it. Coalescing is
+    /// disabled by default; tests that exercise the coalesced path should set
+    /// `state.coalescer = RequestCoalescer::new(enabled_config)`.
     pub fn build_test_app_state(self_region: &str) -> AppState {
         let metadata = Arc::new(MetadataStore::new());
         let routing_config = RoutingConfig {
@@ -922,6 +1185,7 @@ pub(crate) mod test_support {
                 kv: 0.35,
                 load: 0.30,
                 topology: 0.20,
+                cost: 0.0,
             },
             adaptive: hier_kv_gateway_core::config::AdaptiveConfig::default(),
         };
@@ -958,6 +1222,7 @@ pub(crate) mod test_support {
             decision_buffer: Some(DecisionEventBuffer::new(64)),
             gateway_instance: "test-gw".to_string(),
             gateway_region: self_region.to_string(),
+            coalescer: RequestCoalescer::new(CoalescingConfig::default()),
         }
     }
 }

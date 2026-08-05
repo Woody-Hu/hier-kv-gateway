@@ -53,6 +53,7 @@ fn base_weights() -> StrategyWeights {
         kv: 0.35,
         load: 0.30,
         topology: 0.20,
+        cost: 0.0,
     }
 }
 
@@ -135,16 +136,11 @@ fn build_hybrid(adaptive: Option<Arc<AdaptiveWeightController>>) -> HybridStrate
 
 fn routing_ctx() -> RoutingContext {
     RoutingContext {
-        request_id: None,
-        session_id: None,
         model_name: Some(MODEL_NAME.to_string()),
-        token_ids: Vec::new(),
         block_hashes: (1..=16u64).collect(),
         block_size: 16,
-        lora_name: None,
-        cache_namespace: None,
         estimated_output_tokens: 128,
-        requires_tool_calling: false,
+        ..RoutingContext::default()
     }
 }
 

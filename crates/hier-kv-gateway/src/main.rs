@@ -23,6 +23,7 @@ use clap::Parser;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use hier_kv_gateway_api::coalescer::RequestCoalescer;
 use hier_kv_gateway_api::handlers::{AppState, PeerRegistrar};
 use hier_kv_gateway_api::server;
 use hier_kv_gateway_api::telemetry::build_telemetry;
@@ -42,6 +43,7 @@ use hier_kv_gateway_routing::hybrid::HybridStrategy;
 use hier_kv_gateway_routing::kv_aware::KvAwareStrategy;
 use hier_kv_gateway_routing::load_aware::LoadAwareStrategy;
 use hier_kv_gateway_routing::model_aware::ModelAwareStrategy;
+use hier_kv_gateway_routing::plugin::RoutingPlugin;
 use hier_kv_gateway_routing::topology_aware::TopologyAwareStrategy;
 
 mod cluster_bridge;
@@ -124,6 +126,7 @@ async fn main() -> Result<()> {
         decision_buffer: telemetry.buffer,
         gateway_instance: config.instance_id.to_string(),
         gateway_region: config.region.id.to_string(),
+        coalescer: RequestCoalescer::new(config.coalescing.clone()),
     };
 
     let listen_addr = format!("{}:{}", config.listen.addr, config.listen.port);
@@ -238,8 +241,29 @@ async fn discover_and_register_backends(
 /// When `[routing.adaptive] enabled = true`, an EMA-based
 /// [`AdaptiveWeightController`] is attached to the hybrid strategy so its
 /// weights react to forward outcomes and gossip-fed load state at runtime.
+///
+/// ## Plugin extension
+///
+/// Two extra sub-strategies are attached as [`RoutingPlugin`]s when their
+/// config sections are enabled, contributing a weighted score term to the
+/// hybrid ensemble without forking the engine:
+///
+/// * `[cost] enabled = true` — [`CostAwareStrategy`] scores backends by
+///   projected dollar cost (LiteLLM `cost-based-routing` analogue).
+/// * `[model_tier] enabled = true` with `policy.type = "pick"` —
+///   [`ModelTierStrategy`] scores backends by large/small tier match
+///   (Portkey "conditional routing" analogue).
+///
+/// `[model_tier] policy.type = "fallback"` is *not* attached as a hybrid
+/// plugin — it is meant to be the primary strategy so the forwarding loop's
+/// retry realizes "small then large" ordering. When the operator sets
+/// `routing.strategy = "hybrid"` (default) and chooses `fallback`, we install
+/// it as the primary scorer instead.
 fn build_routing_engine(config: &GatewayConfig) -> RoutingEngine {
     use hier_kv_gateway_core::config::StrategyType;
+    use hier_kv_gateway_core::model_tier::TierRoutingPolicy;
+    use hier_kv_gateway_routing::cost_aware::CostAwareStrategy;
+    use hier_kv_gateway_routing::model_tier::ModelTierStrategy;
     use hier_kv_gateway_routing::round_robin::RoundRobinStrategy;
     use hier_kv_gateway_routing::strategy::RoutingStrategy;
 
@@ -268,6 +292,28 @@ fn build_routing_engine(config: &GatewayConfig) -> RoutingEngine {
         let controller = AdaptiveWeightController::new(r.weights.clone(), r.adaptive.clone());
         hybrid = hybrid.with_adaptive(Arc::new(controller));
     }
+
+    // Attach cost-aware sub-strategy as a plugin when enabled. The plugin's
+    // weight comes from `[cost] weight`, participating in the same hybrid
+    // normalization pass as kv/load/topology.
+    if config.cost.enabled {
+        let cost_model = Arc::new(config.cost.build_model());
+        let cost_strategy = CostAwareStrategy::new(cost_model, config.cost.clone());
+        hybrid = hybrid.with_plugin(RoutingPlugin::from_strategy(Arc::new(cost_strategy)));
+    }
+
+    // Attach model-tier sub-strategy as a plugin when enabled AND the policy
+    // is `Pick` (a soft sub-strategy). The `Fallback` policy is installed as
+    // the primary scorer below so the forwarding loop's retry realizes the
+    // "small then large" chain.
+    if config.model_tier.enabled {
+        if matches!(config.model_tier.policy, TierRoutingPolicy::Pick { .. }) {
+            let tier_strategy =
+                ModelTierStrategy::new(Arc::new(config.model_tier.clone()));
+            hybrid = hybrid.with_plugin(RoutingPlugin::from_strategy(Arc::new(tier_strategy)));
+        }
+    }
+
     let session_affinity_ttl = Duration::from_secs(r.session_affinity_ttl_secs);
     let engine = RoutingEngine::new(
         hybrid,
@@ -276,22 +322,39 @@ fn build_routing_engine(config: &GatewayConfig) -> RoutingEngine {
         config.region.id.clone(),
     );
 
-    let primary: Option<Box<dyn RoutingStrategy>> = match r.strategy {
-        StrategyType::Hybrid => None,
-        StrategyType::RoundRobin => Some(Box::new(RoundRobinStrategy::new())),
-        StrategyType::Kv => Some(Box::new(KvAwareStrategy {
-            overlap_score_credit: r.overlap_score_credit,
-            prefill_load_scale: r.prefill_load_scale,
-            ckf_false_positive_penalty: 0.0,
-        })),
-        StrategyType::Model => Some(Box::new(ModelAwareStrategy::default())),
-        StrategyType::Load => Some(Box::new(LoadAwareStrategy::default())),
-        StrategyType::Topology => Some(Box::new(TopologyAwareStrategy {
-            w_rtt: 1.0,
-            w_bw: 0.0,
-            self_region: config.region.id.clone(),
-        })),
-    };
+    // Resolve the primary strategy. The default `Hybrid` keeps the hybrid
+    // ensemble as the primary scorer. The single-strategy variants
+    // (`Kv`/`Load`/`Topology`/`Model`/`RoundRobin`) are realized via
+    // `with_primary_strategy`, exactly as before. The `model_tier` `Fallback`
+    // policy is *also* realized here — when enabled with `policy = fallback`,
+    // it overrides the configured `strategy` to become the primary so the
+    // ranked candidate list becomes "small first, then large" and the
+    // forwarding loop's retry realizes the fallback chain for free.
+    let primary: Option<Box<dyn RoutingStrategy>> =
+        if config.model_tier.enabled
+            && matches!(config.model_tier.policy, TierRoutingPolicy::Fallback)
+        {
+            Some(Box::new(ModelTierStrategy::new(Arc::new(
+                config.model_tier.clone(),
+            ))))
+        } else {
+            match r.strategy {
+                StrategyType::Hybrid => None,
+                StrategyType::RoundRobin => Some(Box::new(RoundRobinStrategy::new())),
+                StrategyType::Kv => Some(Box::new(KvAwareStrategy {
+                    overlap_score_credit: r.overlap_score_credit,
+                    prefill_load_scale: r.prefill_load_scale,
+                    ckf_false_positive_penalty: 0.0,
+                })),
+                StrategyType::Model => Some(Box::new(ModelAwareStrategy::default())),
+                StrategyType::Load => Some(Box::new(LoadAwareStrategy::default())),
+                StrategyType::Topology => Some(Box::new(TopologyAwareStrategy {
+                    w_rtt: 1.0,
+                    w_bw: 0.0,
+                    self_region: config.region.id.clone(),
+                })),
+            }
+        };
     match primary {
         Some(p) => engine.with_primary_strategy(p),
         None => engine,
