@@ -6,7 +6,13 @@
 use thiserror::Error;
 
 /// All error kinds that may occur during Hier KV Gateway operation.
-#[derive(Debug, Error)]
+///
+/// `Clone` is derived so the error can be shared across concurrent awaiters
+/// of an in-flight request (single-flight / request coalescing), where one
+/// leader's terminal error is propagated to every follower awaiting the same
+/// shared future. All variants hold only `String` / unit data, so `Clone` is
+/// trivially sound.
+#[derive(Clone, Debug, Error)]
 pub enum HierKvGatewayError {
     /// All known backends are unavailable; no target can be selected.
     #[error("No available backend instance")]

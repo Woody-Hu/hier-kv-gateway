@@ -123,6 +123,7 @@ async fn hybrid_routing_prefers_backend_with_higher_kv_overlap() {
             kv: 0.35,
             load: 0.30,
             topology: 0.20,
+            cost: 0.0,
         },
         0.0, // temperature = 0 -> greedily select the highest score
     );
@@ -217,6 +218,7 @@ async fn hybrid_routing_session_affinity_reuses_previous_backend() {
             kv: 0.35,
             load: 0.30,
             topology: 0.20,
+            cost: 0.0,
         },
         0.0,
     );

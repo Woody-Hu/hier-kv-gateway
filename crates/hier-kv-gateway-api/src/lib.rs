@@ -25,3 +25,4 @@ pub mod server;
 pub mod handlers;
 pub mod openai_types;
 pub mod telemetry;
+pub mod coalescer;

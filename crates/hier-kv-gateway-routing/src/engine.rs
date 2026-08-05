@@ -624,6 +624,7 @@ mod tests {
                     kv: 0.35,
                     load: 0.30,
                     topology: 0.20,
+                    cost: 0.0,
                 },
                 0.0,
             );

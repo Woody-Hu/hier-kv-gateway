@@ -246,6 +246,7 @@ fn build_engine(load: LoadAwareStrategy) -> RoutingEngine {
         kv: 0.0,
         load: 1.0,
         topology: 0.0,
+        cost: 0.0,
     };
     let hybrid = HybridStrategy::new(kv, model, Box::new(load), topology, weights, 0.0);
     RoutingEngine::new(hybrid, Duration::from_secs(300), 3, RegionId::new("cloud-cn-beijing"))

@@ -195,19 +195,27 @@ impl AdaptiveWeightController {
         let w_kv = self.base.kv * (1.0 + kv_boost);
         let w_load = self.base.load * (1.0 + load_boost);
         let w_topo = self.base.topology;
+        // Cost is treated as an externality by the adaptive loop: pricing is
+        // a static, exogenous signal, not something to feedback-adjust. We
+        // preserve the configured base cost weight and let the normalizer
+        // include it in the sum.
+        let w_cost = self.base.cost;
 
-        let sum = w_kv + w_load + w_topo;
+        let sum = w_kv + w_load + w_topo + w_cost;
         if sum <= 0.0 {
             return self.base.clone();
         }
-        let floor = self.cfg.min_weight.clamp(0.0, 1.0 / 3.0);
-        let [kv, load, topology] =
-            normalize_with_floor([w_kv / sum, w_load / sum, w_topo / sum], floor);
+        let floor = self.cfg.min_weight.clamp(0.0, 1.0 / 4.0);
+        let [kv, load, topology, cost] = normalize_with_floor(
+            [w_kv / sum, w_load / sum, w_topo / sum, w_cost / sum],
+            floor,
+        );
 
         StrategyWeights {
             kv,
             load,
             topology,
+            cost,
         }
     }
 }
@@ -218,8 +226,11 @@ impl AdaptiveWeightController {
 /// the remaining elements are scaled proportionally to fill the leftover
 /// budget. When no element violates the floor the proportions are preserved
 /// exactly, so the no-signal case returns the base ratios unchanged.
-fn normalize_with_floor(mut w: [f64; 3], floor: f64) -> [f64; 3] {
-    let mut clamped = [false; 3];
+///
+/// Generic over the array length so the same routine covers the 3-weight
+/// (kv/load/topology) and 4-weight (with cost) shapes.
+fn normalize_with_floor<const N: usize>(mut w: [f64; N], floor: f64) -> [f64; N] {
+    let mut clamped = [false; N];
     loop {
         let fixed: f64 = w
             .iter()
@@ -236,7 +247,7 @@ fn normalize_with_floor(mut w: [f64; 3], floor: f64) -> [f64; 3] {
         let budget = 1.0 - fixed;
         let n_rest = clamped.iter().filter(|c| !**c).count() as f64;
         let mut newly_clamped = false;
-        for i in 0..3 {
+        for i in 0..N {
             if clamped[i] {
                 continue;
             }
@@ -306,6 +317,7 @@ mod tests {
             kv: 0.35,
             load: 0.30,
             topology: 0.20,
+            cost: 0.0,
         }
     }
 
@@ -353,12 +365,17 @@ mod tests {
         let ctl = AdaptiveWeightController::new(base_weights(), config(true));
         let meta = MetadataStore::new();
         let w = ctl.compute(&meta);
-        assert!((w.kv - 0.35 / 0.85).abs() < 1e-9 || (w.kv - 0.35).abs() < 0.01);
         // Base weights are not normalized in config; controller normalizes them.
-        let sum = w.kv + w.load + w.topology;
+        let sum = w.kv + w.load + w.topology + w.cost;
         assert!((sum - 1.0).abs() < 1e-9);
-        // With no signals the ratios match the base weights.
+        // With no signals the kv/load ratio matches the base ratio. The
+        // absolute values shift slightly because the cost weight's
+        // min-weight floor (0.05) eats into the budget, but the *ratios*
+        // between the non-cost weights stay anchored to the configured base.
         assert!((w.kv / w.load - 0.35 / 0.30).abs() < 1e-9);
+        assert!((w.load / w.topology - 0.30 / 0.20).abs() < 1e-9);
+        // Cost has a zero base, so it sits at the min-weight floor.
+        assert!((w.cost - 0.05).abs() < 1e-9);
     }
 
     #[test]
@@ -377,7 +394,7 @@ mod tests {
             w,
             base
         );
-        assert!((w.kv + w.load + w.topology - 1.0).abs() < 1e-9);
+        assert!((w.kv + w.load + w.topology + w.cost - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -461,13 +478,15 @@ mod tests {
             kv: 0.0,
             load: 1.0,
             topology: 0.0,
+            cost: 0.0,
         };
         let ctl = AdaptiveWeightController::new(weights, config(true));
         let meta = MetadataStore::new();
         let w = ctl.compute(&meta);
         assert!(w.kv >= 0.05 - 1e-9);
         assert!(w.topology >= 0.05 - 1e-9);
-        assert!((w.kv + w.load + w.topology - 1.0).abs() < 1e-9);
+        assert!(w.cost >= 0.05 - 1e-9);
+        assert!((w.kv + w.load + w.topology + w.cost - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -524,11 +543,12 @@ mod tests {
         /// Base weights normalized the same way `compute` normalizes, for
         /// test comparisons.
         fn compute_base_normalized(&self) -> StrategyWeights {
-            let sum = self.base.kv + self.base.load + self.base.topology;
+            let sum = self.base.kv + self.base.load + self.base.topology + self.base.cost;
             StrategyWeights {
                 kv: self.base.kv / sum,
                 load: self.base.load / sum,
                 topology: self.base.topology / sum,
+                cost: self.base.cost / sum,
             }
         }
     }

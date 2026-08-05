@@ -9,8 +9,11 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{BackendType, Endpoint, Quantization};
+use crate::coalescing::CoalescingConfig;
+use crate::cost::CostConfig;
 use crate::error::{HierKvGatewayError, Result};
 use crate::ids::{InstanceId, RegionId, RegionTier};
+use crate::model_tier::ModelTierConfig;
 use crate::tenant::TenantPriority;
 
 /// Top-level gateway configuration.
@@ -41,6 +44,18 @@ pub struct GatewayConfig {
     /// Multi-tenant scheduling configuration.
     #[serde(default)]
     pub tenant: TenantConfig,
+    /// Cost-model configuration for cost-aware routing. Off by default;
+    /// existing configurations parse unchanged (`enabled = false`).
+    #[serde(default)]
+    pub cost: CostConfig,
+    /// Large/small model tiering configuration. Off by default; existing
+    /// configurations parse unchanged (`enabled = false`).
+    #[serde(default)]
+    pub model_tier: ModelTierConfig,
+    /// Request coalescing (single-flight) configuration. Off by default;
+    /// existing configurations parse unchanged (`enabled = false`).
+    #[serde(default)]
+    pub coalescing: CoalescingConfig,
 }
 
 /// Region configuration.
@@ -98,7 +113,12 @@ pub enum StrategyType {
 
 /// Routing strategy weights.
 ///
-/// The three weights are typically normalized before participating in hybrid scoring.
+/// The weights are typically normalized before participating in hybrid scoring.
+///
+/// `cost` is serde-defaulted to `0.0` so existing configurations that predate
+/// cost-aware routing continue to parse unchanged; setting it to a positive
+/// value (and `[cost] enabled = true`) opts the hybrid strategy into the
+/// cost-aware sub-strategy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StrategyWeights {
     /// KV cache hit weight.
@@ -107,6 +127,11 @@ pub struct StrategyWeights {
     pub load: f64,
     /// Topology distance weight.
     pub topology: f64,
+    /// Cost (projected dollar cost) weight. Defaults to `0.0` so existing
+    /// configs keep parsing; a positive value is only effective when
+    /// [`CostConfig::enabled`] is `true`.
+    #[serde(default)]
+    pub cost: f64,
 }
 
 /// Routing-related configuration.

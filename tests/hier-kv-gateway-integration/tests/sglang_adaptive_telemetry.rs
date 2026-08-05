@@ -227,6 +227,7 @@ async fn build_gateway_state(
         kv: 0.35,
         load: 0.30,
         topology: 0.20,
+        cost: 0.0,
     };
     let mut hybrid = HybridStrategy::new(
         Box::new(KvAwareStrategy::default()),
@@ -263,6 +264,7 @@ async fn build_gateway_state(
             kv: 0.35,
             load: 0.30,
             topology: 0.20,
+            cost: 0.0,
         },
         adaptive: AdaptiveConfig::default(),
     };
@@ -280,6 +282,9 @@ async fn build_gateway_state(
         decision_buffer: Some(buffer.clone()),
         gateway_instance: "gw-test".to_string(),
         gateway_region: REGION.to_string(),
+        coalescer: hier_kv_gateway_api::coalescer::RequestCoalescer::new(
+            hier_kv_gateway_core::coalescing::CoalescingConfig::default(),
+        ),
     };
     (state, controller)
 }
@@ -426,7 +431,7 @@ async fn failover_event_records_all_attempts() {
         });
     }
 
-    let weights = StrategyWeights { kv: 0.35, load: 0.30, topology: 0.20 };
+    let weights = StrategyWeights { kv: 0.35, load: 0.30, topology: 0.20, cost: 0.0 };
     let hybrid = HybridStrategy::new(
         Box::new(KvAwareStrategy::default()),
         Box::new(ModelAwareStrategy::default()),
@@ -448,7 +453,7 @@ async fn failover_event_records_all_attempts() {
         temperature: 0.0,
         session_affinity_ttl_secs: 300,
         max_retries: 3,
-        weights: StrategyWeights { kv: 0.35, load: 0.30, topology: 0.20 },
+        weights: StrategyWeights { kv: 0.35, load: 0.30, topology: 0.20, cost: 0.0 },
         adaptive: AdaptiveConfig::default(),
     };
     let state = AppState {
@@ -463,6 +468,9 @@ async fn failover_event_records_all_attempts() {
         decision_buffer: Some(buffer.clone()),
         gateway_instance: "gw-test".to_string(),
         gateway_region: REGION.to_string(),
+        coalescer: hier_kv_gateway_api::coalescer::RequestCoalescer::new(
+            hier_kv_gateway_core::coalescing::CoalescingConfig::default(),
+        ),
     };
     let gateway = start_gateway(state).await;
 

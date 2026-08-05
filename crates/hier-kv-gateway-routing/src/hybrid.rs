@@ -1,7 +1,8 @@
 //! Hybrid intelligent routing strategy (default strategy).
 //!
 //! Fuses the scores of three sub-strategies — KV-aware, load-aware, and
-//! topology-aware:
+//! topology-aware — plus any number of *plugin* sub-strategies registered
+//! via [`HybridStrategy::with_plugin`]:
 //!
 //! 1. First apply the model-aware strategy as a hard filter on the candidate set (remove `score == 0`).
 //! 2. Call `evaluate` on each available sub-strategy to obtain its own `ScoredBackend` list.
@@ -11,6 +12,18 @@
 //! 5. When `temperature > 0`, the caller samples via softmax; otherwise greedily pick the highest score.
 //!
 //! Outputs a `ScoredBackend` list sorted in descending order by `hybrid_score`; the `score` field is the hybrid score.
+//!
+//! ## Plugin sub-strategies
+//!
+//! Beyond the three built-in sub-strategies, the hybrid strategy accepts
+//! zero or more [`RoutingPlugin`](crate::plugin::RoutingPlugin)s that
+//! contribute their own weighted score term. Each plugin's weight is taken
+//! from [`RoutingStrategy::weight`] (which for
+//! [`CostAwareStrategy`](crate::cost_aware::CostAwareStrategy) reads the
+//! configured `[cost] weight`). Plugins are evaluated in registration order
+//! but their weights participate in the same normalization pass as the
+//! built-in sub-strategies, so adding a plugin never changes the absolute
+//! scale of `hybrid_score` — only its composition.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +37,7 @@ use hier_kv_gateway_core::request::{RoutingContext, ScoredBackend};
 use hier_kv_gateway_metadata::store::MetadataStore;
 
 use crate::adaptive::AdaptiveWeightController;
+use crate::plugin::RoutingPlugin;
 use crate::strategy::RoutingStrategy;
 
 /// Load metrics staleness threshold: when exceeded, the load weight is discounted.
@@ -46,6 +60,11 @@ pub struct HybridStrategy {
     /// Optional adaptive weight controller; when present, the effective
     /// weights come from its feedback loop instead of `weights`.
     adaptive: Option<Arc<AdaptiveWeightController>>,
+    /// Extra plugin sub-strategies (cost-aware, latency-SLO, etc.). Each
+    /// plugin contributes a weighted term to the hybrid score; their
+    /// weights are taken from [`RoutingStrategy::weight`] and participate
+    /// in the same normalization pass as the built-in sub-strategies.
+    plugins: Vec<RoutingPlugin>,
 }
 
 impl HybridStrategy {
@@ -66,6 +85,7 @@ impl HybridStrategy {
             weights,
             temperature,
             adaptive: None,
+            plugins: Vec::new(),
         }
     }
 
@@ -80,6 +100,19 @@ impl HybridStrategy {
         self
     }
 
+    /// Attach an extra plugin sub-strategy (builder style).
+    ///
+    /// The plugin's weight comes from [`RoutingStrategy::weight`] (e.g.
+    /// `CostAwareStrategy` returns the configured `[cost] weight`). A
+    /// plugin with weight `0.0` is still evaluated (so its
+    /// `is_available` / `evaluate` side effects run) but contributes
+    /// nothing to the hybrid score — useful for staging a price catalog
+    /// without affecting routing.
+    pub fn with_plugin(mut self, plugin: RoutingPlugin) -> Self {
+        self.plugins.push(plugin);
+        self
+    }
+
     /// Borrow the attached adaptive weight controller, if any.
     ///
     /// The forwarding loop uses this handle to feed execution metrics
@@ -87,6 +120,11 @@ impl HybridStrategy {
     /// controller after each request.
     pub fn adaptive(&self) -> Option<&Arc<AdaptiveWeightController>> {
         self.adaptive.as_ref()
+    }
+
+    /// Borrow the registered plugin sub-strategies.
+    pub fn plugins(&self) -> &[RoutingPlugin] {
+        &self.plugins
     }
 
     /// Snapshot of the weights most recently used for scoring.
@@ -202,13 +240,28 @@ impl RoutingStrategy for HybridStrategy {
         };
         let weight_topo = base.topology;
 
-        // Normalize weights so the sum is 1.0
-        let total = weight_kv + weight_load + weight_topo;
+        // Plugin weights: read each plugin's static weight; skip plugins
+        // that report `is_available(meta) == false`. The plugin weight
+        // source is `RoutingStrategy::weight`, so e.g. the cost-aware
+        // strategy's weight comes from `[cost] weight` in TOML.
+        let mut plugin_weights: Vec<f64> = Vec::with_capacity(self.plugins.len());
+        for p in &self.plugins {
+            let w = if p.is_available(meta) { p.weight() } else { 0.0 };
+            plugin_weights.push(w);
+        }
+
+        // Normalize weights so the sum is 1.0. The plugin weights join the
+        // built-in kv/load/topology weights in the same denominator so the
+        // normalized `hybrid_score` stays in `[0, 1]` regardless of how
+        // many plugins are attached.
+        let total = weight_kv + weight_load + weight_topo
+            + plugin_weights.iter().sum::<f64>();
         if total > 0.0 {
             weight_kv /= total;
             weight_load /= total;
         } else {
-            // All zero: fall back to uniform weights
+            // All zero: fall back to uniform weights across kv/load/topology
+            // (plugins with zero configured weight stay at zero).
             weight_kv = 1.0 / 3.0;
             weight_load = 1.0 / 3.0;
         }
@@ -217,6 +270,13 @@ impl RoutingStrategy for HybridStrategy {
         } else {
             1.0 / 3.0
         };
+        for w in plugin_weights.iter_mut() {
+            if total > 0.0 {
+                *w /= total;
+            } else {
+                *w = 0.0;
+            }
+        }
 
         // 3. Each sub-strategy scores the filtered candidate set
         let kv_scores = if weight_kv > 0.0 {
@@ -234,6 +294,18 @@ impl RoutingStrategy for HybridStrategy {
         } else {
             Vec::new()
         };
+        // Plugin scores: collected in registration order. Each plugin's
+        // normalized score map is computed once and looked up per
+        // candidate below.
+        let mut plugin_norms: Vec<HashMap<BackendId, f64>> = Vec::with_capacity(self.plugins.len());
+        for (i, p) in self.plugins.iter().enumerate() {
+            if plugin_weights[i] <= 0.0 {
+                plugin_norms.push(HashMap::new());
+                continue;
+            }
+            let scores = p.strategy.evaluate(ctx, &filtered, meta).await?;
+            plugin_norms.push(Self::normalize_costs(&scores));
+        }
 
         // 4. Normalize each sub-strategy's cost to [0, 1]
         let kv_norm = Self::normalize_costs(&kv_scores);
@@ -247,7 +319,11 @@ impl RoutingStrategy for HybridStrategy {
             let load_s = load_norm.get(cand).copied().unwrap_or(0.0);
             let topo_s = topo_norm.get(cand).copied().unwrap_or(0.0);
 
-            let hybrid_score = weight_kv * kv_s + weight_load * load_s + weight_topo * topo_s;
+            let mut hybrid_score = weight_kv * kv_s + weight_load * load_s + weight_topo * topo_s;
+            for (i, norm) in plugin_norms.iter().enumerate() {
+                let s = norm.get(cand).copied().unwrap_or(0.0);
+                hybrid_score += plugin_weights[i] * s;
+            }
 
             // raw_cost takes the negative hybrid_score to keep semantic
             // consistency with "lower raw_cost is better" upstream of SortBackend
