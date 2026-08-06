@@ -938,6 +938,7 @@ dependencies = [
  "hier-kv-gateway-cluster",
  "hier-kv-gateway-connector",
  "hier-kv-gateway-core",
+ "hier-kv-gateway-kv-estimate",
  "hier-kv-gateway-metadata",
  "hier-kv-gateway-routing",
  "parking_lot",
@@ -1027,6 +1028,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "futures",
+ "hier-kv-gateway-kv-estimate",
  "parking_lot",
  "serde",
  "serde_json",
@@ -1061,6 +1063,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hier-kv-gateway-kv-estimate"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "toml",
+]
+
+[[package]]
 name = "hier-kv-gateway-metadata"
 version = "0.1.0"
 dependencies = [
@@ -1089,6 +1102,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "hier-kv-gateway-core",
+ "hier-kv-gateway-kv-estimate",
  "hier-kv-gateway-metadata",
  "parking_lot",
  "rand 0.9.5",

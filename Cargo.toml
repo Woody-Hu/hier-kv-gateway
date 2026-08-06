@@ -7,6 +7,7 @@ members = [
     "crates/hier-kv-gateway-cluster",
     "crates/hier-kv-gateway-connector",
     "crates/hier-kv-gateway-api",
+    "crates/hier-kv-gateway-kv-estimate",
     "crates/hier-kv-gateway",
     "tests/hier-kv-gateway-integration",
 ]
@@ -23,6 +24,7 @@ hier-kv-gateway-routing = { path = "crates/hier-kv-gateway-routing" }
 hier-kv-gateway-cluster = { path = "crates/hier-kv-gateway-cluster" }
 hier-kv-gateway-connector = { path = "crates/hier-kv-gateway-connector" }
 hier-kv-gateway-api = { path = "crates/hier-kv-gateway-api" }
+hier-kv-gateway-kv-estimate = { path = "crates/hier-kv-gateway-kv-estimate" }
 hier-kv-gateway-integration = { path = "tests/hier-kv-gateway-integration" }
 
 tokio = { version = "1", features = ["full"] }
