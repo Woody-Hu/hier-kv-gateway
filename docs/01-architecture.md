@@ -119,6 +119,7 @@ PoolId = (IndexerDomainId, RegionId)
 │   ├── Strategy: Model Aware                         │
 │   ├── Strategy: Load Aware                          │
 │   ├── Strategy: Topology Aware                      │
+│   ├── Plugin: KV Capacity (可选, [kv_estimate])      │
 │   └── Strategy: Hybrid (默认)                       │
 ├─────────────────────────────────────────────────────┤
 │  Metadata Layer                                      │
@@ -438,6 +439,7 @@ hier-kv-gateway/
 │   ├── hier-kv-gateway-routing/        # 路由引擎: 5种策略 + Hybrid
 │   ├── hier-kv-gateway-cluster/         # Gossip 集群通信 + CKF Relay
 │   ├── hier-kv-gateway-connector/       # 后端连接器 trait + 内置实现
+│   ├── hier-kv-gateway-kv-estimate/     # KV 显存估算（独立叶子 crate，解析公式 + 插件）
 │   ├── hier-kv-gateway-api/             # HTTP API server (OpenAI 兼容)
 │   └── hier-kv-gateway/                # 主二进制: 组装所有组件
 ├── tests/                     # 集成测试 (真实后端, 无 mock)

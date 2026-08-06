@@ -446,3 +446,93 @@ forward(backend, request):
 
 max_retries = 3
 ```
+
+---
+
+## 9. 策略六：KV Capacity Aware Routing（KV 容量感知路由）
+
+> 作为 `RoutingPlugin` 挂到 Hybrid（见 [05-kv-estimation.md](05-kv-estimation.md) 的数据半）。
+
+### 9.1 目标
+
+估算本次请求的 KV Cache 显存占用，按各后端**剩余容量**打分，把放不下的后端排除掉 —— 这是容量准入 / load shedding 决策。与 `KvAwareStrategy`（按前缀命中重叠打分，减少 prefill 工作）互补：`KvAwareStrategy` 决定「少做多少 prefill」，`KvCapacityStrategy` 决定「放不放得下」。
+
+### 9.2 估算来源
+
+请求占用来自独立叶子 crate `hier-kv-gateway-kv-estimate` 的解析公式（非仿真，与 vLLM/SGLang/Mooncake 一致）：
+
+```
+per_token = f(num_layers, num_kv_heads, head_dim, dtype, attention族)  // MLA 用 kv_lora_rank+qk_rope_head_dim
+seq_len   = input_tokens + estimated_output_tokens   // output 用客户端 max_tokens 作保守上界
+effective = min(seq_len, sliding_window)              // 滑动窗口截断
+blocks    = ceil(effective / block_size) * batch_size
+bytes     = per_token * batch_size * (blocks * block_size)   // block-padded
+```
+
+### 9.3 容量信号选择与打分
+
+对每个候选后端：
+
+```
+1. 解析后端实际服务的模型（优先 ctx.model_name 精确匹配，否则后端首个模型）
+2. registry.estimate(model, input) → None 时按 exclude_on_unknown_spec 处理
+3. 读取后端资源余量，选容量信号：
+   - KV-block 路径（精确，优先）：kv_total_blocks>0 且 block_size>0
+       available_bytes = (kv_total_blocks - kv_used_blocks) * per_block_bytes
+   - GPU 显存路径（保守 fallback）：gpu_memory_total_mb>0
+       available_bytes = (gpu_memory_total_mb - gpu_memory_used_mb) * 1e6 * gpu_mem_safety_fraction
+   - 无信号：中立 (raw_cost=0, score=1)，让其他子策略决定
+4. 准入判断：
+   if available_bytes <= 0 or bytes > available_bytes:
+       排除 (raw_cost=∞, score=0)            // load shedding
+   else:
+       ratio = bytes / available_bytes ∈ [0,1]
+       raw_cost = ratio                       // 余量越多 cost 越低
+       score = 1 / (1 + ratio)
+```
+
+### 9.4 关键设计决策
+
+1. **output 用 `max_tokens` 作保守上界**：估算的 KV 增长永不低估，镜像 `LoadAwareStrategy::w_decode` 与 `CostAwareStrategy` 的输出投影。
+2. **`f64::INFINITY` 而非 `f64::MAX`**：排除用 `∞`（非有限），由 `HybridStrategy::normalize_costs` 通过 `!is_finite()` 识别。`f64::MAX` 是有限的，会被误判为「很贵但有效」。
+3. **GPU 显存 fallback 用安全比例**：KV 不是唯一 GPU 内存消费者（还有权重、激活），仅「当前空闲显存 × `gpu_mem_safety_fraction`」可被声明，避免把整卡空闲都算给 KV。
+4. **未知 spec 默认中立**：`exclude_on_unknown_spec=false` 时未知模型后端让其他子策略决定，避免在没把握时饿死确有余量的后端。
+5. **与 `KvAwareStrategy` 独立归一化**：两策略在 Hybrid 中是独立子策略，各自 `normalize_costs`，互不搅语义 —— 这与 `LoadAwareStrategy` vs `CostAwareStrategy` 的关系一致。
+
+### 9.5 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `enabled` | `false` | 关闭时不挂载策略 |
+| `weight` | `0.20` | Hybrid 权重 |
+| `gpu_mem_safety_fraction` | `0.5` | GPU 显存 fallback 可声明比例 |
+| `exclude_on_unknown_spec` | `false` | 未知 spec 排除(true)/中立(false) |
+
+### 9.6 配置示例
+
+```toml
+[kv_estimate]
+enabled = true
+weight = 0.20
+gpu_mem_safety_fraction = 0.5
+exclude_on_unknown_spec = false
+
+# 可选：注册私有模型 spec（字段对应 HuggingFace config.json）
+[[kv_estimate.models]]
+name = "my-private-model"
+num_layers = 20
+num_kv_heads = 4
+head_dim = 96
+dtype = "fp16"
+```
+
+### 9.7 端到端算例
+
+Llama-3-8B（per_token=131_072 B），4096 prompt，block_size 16：
+
+```
+blocks_needed = ceil(4096/16) = 256
+后端 A: kv_total=1000, kv_used=0   → free=1000, ratio=256/1000=0.256  (admitted)
+后端 B: kv_total=1000, kv_used=700 → free=300,  ratio=256/300=0.853  (admitted, 更高 cost)
+后端 C: kv_total=1000, kv_used=995 → free=5,    256>5                → 排除 (raw_cost=∞)
+```

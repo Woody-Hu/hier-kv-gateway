@@ -122,6 +122,7 @@ A Pool corresponds to a set of Backends within a Region that share the same Inde
 │   ├── Strategy: Model Aware                         │
 │   ├── Strategy: Load Aware                          │
 │   ├── Strategy: Topology Aware                      │
+│   ├── Plugin: KV Capacity (optional, [kv_estimate]) │
 │   └── Strategy: Hybrid (default)                    │
 ├─────────────────────────────────────────────────────┤
 │  Metadata Layer                                      │
@@ -443,6 +444,7 @@ hier-kv-gateway/
 │   ├── hier-kv-gateway-routing/        # routing engine: 5 strategies + Hybrid
 │   ├── hier-kv-gateway-cluster/         # Gossip cluster communication + CKF Relay
 │   ├── hier-kv-gateway-connector/       # backend connector trait + built-in implementations
+│   ├── hier-kv-gateway-kv-estimate/     # KV memory estimation (standalone leaf crate, analytical formulas + plugins)
 │   ├── hier-kv-gateway-api/             # HTTP API server (OpenAI compatible)
 │   └── hier-kv-gateway/                # main binary: assembles all components
 ├── tests/                     # integration tests (real backends, no mocks)

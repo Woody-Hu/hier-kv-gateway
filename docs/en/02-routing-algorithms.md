@@ -446,3 +446,93 @@ forward(backend, request):
 
 max_retries = 3
 ```
+
+---
+
+## 9. Strategy 6: KV Capacity Aware Routing
+
+> Attached to Hybrid as a `RoutingPlugin` (the data half lives in [05-kv-estimation.md](../05-kv-estimation.md)).
+
+### 9.1 Goal
+
+Estimate the KV-cache memory footprint of the incoming request and score each candidate backend by its **remaining capacity**, excluding backends that cannot fit the request — the capacity-admission / load-shedding decision. Complementary to `KvAwareStrategy` (which scores by prefix-hit overlap to reduce prefill work): `KvAwareStrategy` decides "how much prefill to skip", `KvCapacityStrategy` decides "whether it fits at all".
+
+### 9.2 Estimate source
+
+The request footprint comes from the standalone leaf crate `hier-kv-gateway-kv-estimate`'s analytical formulas (not a simulation; matches vLLM/SGLang/Mooncake):
+
+```
+per_token = f(num_layers, num_kv_heads, head_dim, dtype, attention family)  // MLA uses kv_lora_rank+qk_rope_head_dim
+seq_len   = input_tokens + estimated_output_tokens   // output uses client max_tokens as a conservative upper bound
+effective = min(seq_len, sliding_window)              // sliding-window cap
+blocks    = ceil(effective / block_size) * batch_size
+bytes     = per_token * batch_size * (blocks * block_size)   // block-padded
+```
+
+### 9.3 Capacity-signal selection & scoring
+
+For each candidate backend:
+
+```
+1. Resolve the model the backend actually serves (prefer exact ctx.model_name match, else backend's first model)
+2. registry.estimate(model, input) → on None, apply exclude_on_unknown_spec policy
+3. Read the backend's resource headroom, pick a capacity signal:
+   - KV-block path (exact, preferred): kv_total_blocks>0 and block_size>0
+       available_bytes = (kv_total_blocks - kv_used_blocks) * per_block_bytes
+   - GPU-memory path (conservative fallback): gpu_memory_total_mb>0
+       available_bytes = (gpu_memory_total_mb - gpu_memory_used_mb) * 1e6 * gpu_mem_safety_fraction
+   - No signal: neutral (raw_cost=0, score=1), let other sub-strategies decide
+4. Admission:
+   if available_bytes <= 0 or bytes > available_bytes:
+       exclude (raw_cost=∞, score=0)            // load shedding
+   else:
+       ratio = bytes / available_bytes ∈ [0,1]
+       raw_cost = ratio                       // more headroom → lower cost
+       score = 1 / (1 + ratio)
+```
+
+### 9.4 Key design decisions
+
+1. **output uses `max_tokens` as a conservative upper bound**: the estimated KV growth never underestimates, mirroring `LoadAwareStrategy::w_decode` and `CostAwareStrategy`'s output projection.
+2. **`f64::INFINITY` not `f64::MAX`**: exclusion uses `∞` (non-finite), recognized by `HybridStrategy::normalize_costs` via `!is_finite()`. `f64::MAX` is finite and would be misread as "very expensive but valid".
+3. **GPU-memory fallback uses a safety fraction**: KV is not the only GPU memory consumer (weights, activations), so only "currently free memory × `gpu_mem_safety_fraction`" is claimable — avoids treating the whole free card as KV budget.
+4. **Unknown spec is neutral by default**: with `exclude_on_unknown_spec=false`, an unknown-model backend is left to other sub-strategies, avoiding starving a backend that does have room when we're unsure.
+5. **Independent normalization from `KvAwareStrategy`**: the two are independent sub-strategies in Hybrid, each doing its own `normalize_costs` — semantics don't cross. Same relationship as `LoadAwareStrategy` vs `CostAwareStrategy`.
+
+### 9.5 Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `enabled` | `false` | When off the strategy is not attached |
+| `weight` | `0.20` | Hybrid weight |
+| `gpu_mem_safety_fraction` | `0.5` | Claimable fraction in GPU-memory fallback |
+| `exclude_on_unknown_spec` | `false` | Exclude (true) / neutral (false) on unknown spec |
+
+### 9.6 Configuration example
+
+```toml
+[kv_estimate]
+enabled = true
+weight = 0.20
+gpu_mem_safety_fraction = 0.5
+exclude_on_unknown_spec = false
+
+# Optional: register a private model spec (fields map to HuggingFace config.json)
+[[kv_estimate.models]]
+name = "my-private-model"
+num_layers = 20
+num_kv_heads = 4
+head_dim = 96
+dtype = "fp16"
+```
+
+### 9.7 End-to-end example
+
+Llama-3-8B (per_token=131_072 B), 4096 prompt, block_size 16:
+
+```
+blocks_needed = ceil(4096/16) = 256
+backend A: kv_total=1000, kv_used=0   → free=1000, ratio=256/1000=0.256  (admitted)
+backend B: kv_total=1000, kv_used=700 → free=300,  ratio=256/300=0.853  (admitted, higher cost)
+backend C: kv_total=1000, kv_used=995 → free=5,    256>5                → excluded (raw_cost=∞)
+```
