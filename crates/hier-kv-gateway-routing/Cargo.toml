@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 hier-kv-gateway-core = { workspace = true }
 hier-kv-gateway-metadata = { workspace = true }
+hier-kv-gateway-kv-estimate = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
@@ -40,4 +41,8 @@ harness = false
 
 [[bench]]
 name = "cost_tier_plugins"
+harness = false
+
+[[bench]]
+name = "kv_capacity"
 harness = false

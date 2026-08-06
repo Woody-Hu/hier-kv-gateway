@@ -16,6 +16,15 @@ use crate::ids::{InstanceId, RegionId, RegionTier};
 use crate::model_tier::ModelTierConfig;
 use crate::tenant::TenantPriority;
 
+/// Re-export of the KV-estimation config section.
+///
+/// `KvEstimateConfig` is defined in the leaf `hier-kv-gateway-kv-estimate`
+/// crate (so the estimator stays reusable with no gateway dependency) and is
+/// surfaced here so it parses as the `[kv_estimate]` section of
+/// [`GatewayConfig`]. The *behaviour* half — `KvCapacityStrategy` — lives in
+/// the `hier-kv-gateway-routing` crate.
+pub use hier_kv_gateway_kv_estimate::KvEstimateConfig;
+
 /// Top-level gateway configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GatewayConfig {
@@ -52,6 +61,14 @@ pub struct GatewayConfig {
     /// configurations parse unchanged (`enabled = false`).
     #[serde(default)]
     pub model_tier: ModelTierConfig,
+    /// KV-cache memory estimation & capacity-aware routing. Off by default;
+    /// existing configurations parse unchanged (`enabled = false`). When
+    /// enabled, the routing engine attaches a `KvCapacityStrategy` plugin
+    /// that estimates each request's KV footprint (via the
+    /// `hier-kv-gateway-kv-estimate` leaf crate) and scores backends by
+    /// available KV / GPU-memory headroom.
+    #[serde(default)]
+    pub kv_estimate: KvEstimateConfig,
     /// Request coalescing (single-flight) configuration. Off by default;
     /// existing configurations parse unchanged (`enabled = false`).
     #[serde(default)]

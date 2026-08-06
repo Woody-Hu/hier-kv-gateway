@@ -34,6 +34,7 @@ use hier_kv_gateway_cluster::tcp_transport::TcpClusterTransport;
 use hier_kv_gateway_cluster::transport::ClusterTransport;
 use hier_kv_gateway_core::config::{load_from_file, GatewayConfig};
 use hier_kv_gateway_core::topology::{GeoCoord, RegionInfo};
+use hier_kv_gateway_kv_estimate::KvEstimationRegistry;
 use hier_kv_gateway_metadata::store::MetadataStore;
 use hier_kv_gateway_connector::registry::ConnectorRegistry;
 use hier_kv_gateway_connector::resilience::{CircuitBreakerRegistry, RetryPolicy};
@@ -41,6 +42,7 @@ use hier_kv_gateway_routing::adaptive::AdaptiveWeightController;
 use hier_kv_gateway_routing::engine::RoutingEngine;
 use hier_kv_gateway_routing::hybrid::HybridStrategy;
 use hier_kv_gateway_routing::kv_aware::KvAwareStrategy;
+use hier_kv_gateway_routing::kv_capacity::KvCapacityStrategy;
 use hier_kv_gateway_routing::load_aware::LoadAwareStrategy;
 use hier_kv_gateway_routing::model_aware::ModelAwareStrategy;
 use hier_kv_gateway_routing::plugin::RoutingPlugin;
@@ -312,6 +314,23 @@ fn build_routing_engine(config: &GatewayConfig) -> RoutingEngine {
                 ModelTierStrategy::new(Arc::new(config.model_tier.clone()));
             hybrid = hybrid.with_plugin(RoutingPlugin::from_strategy(Arc::new(tier_strategy)));
         }
+    }
+
+    // Attach the KV-capacity sub-strategy as a plugin when enabled. It
+    // estimates each request's KV-cache footprint via the
+    // `hier-kv-gateway-kv-estimate` leaf crate (builtin model catalog +
+    // operator `[[kv_estimate.models]]` overrides) and scores backends by
+    // available KV-block / GPU-memory headroom, excluding backends that
+    // cannot fit the request. The plugin's weight comes from
+    // `[kv_estimate] weight`, participating in the same hybrid
+    // normalization pass as kv/load/topology/cost.
+    if config.kv_estimate.enabled {
+        let registry = Arc::new(KvEstimationRegistry::with_catalog(
+            config.kv_estimate.build_catalog(),
+        ));
+        let kv_cap_strategy =
+            KvCapacityStrategy::new(registry, config.kv_estimate.clone());
+        hybrid = hybrid.with_plugin(RoutingPlugin::from_strategy(Arc::new(kv_cap_strategy)));
     }
 
     let session_affinity_ttl = Duration::from_secs(r.session_affinity_ttl_secs);
@@ -588,5 +607,43 @@ mod tests {
         assert!((w.kv - 0.35).abs() < 1e-9);
         assert!((w.load - 0.30).abs() < 1e-9);
         assert!((w.topology - 0.20).abs() < 1e-9);
+    }
+
+    /// The multi-backend example enables `[kv_estimate]`, so the engine must
+    /// attach exactly one `kv_capacity` plugin to the hybrid ensemble.
+    #[test]
+    fn multi_backend_example_attaches_kv_capacity_plugin() {
+        let cfg = load_from_file(example_path("multi-backend.toml")).unwrap();
+        assert!(cfg.kv_estimate.enabled);
+        let engine = build_routing_engine(&cfg);
+        let kv_cap_plugins: Vec<_> = engine
+            .hybrid
+            .plugins()
+            .iter()
+            .filter(|p| p.id == "kv_capacity")
+            .collect();
+        assert_eq!(
+            kv_cap_plugins.len(),
+            1,
+            "exactly one kv_capacity plugin should be attached"
+        );
+        assert!((kv_cap_plugins[0].weight() - 0.20).abs() < 1e-9);
+    }
+
+    /// When `[kv_estimate] enabled = false` (the default), no kv_capacity
+    /// plugin is attached — the existing examples without the section must
+    /// keep building an engine with zero kv_capacity plugins.
+    #[test]
+    fn disabled_kv_estimate_attaches_no_plugin() {
+        let cfg = load_from_file(example_path("sglang-backend.toml")).unwrap();
+        assert!(!cfg.kv_estimate.enabled);
+        let engine = build_routing_engine(&cfg);
+        let kv_cap_plugins = engine
+            .hybrid
+            .plugins()
+            .iter()
+            .filter(|p| p.id == "kv_capacity")
+            .count();
+        assert_eq!(kv_cap_plugins, 0);
     }
 }

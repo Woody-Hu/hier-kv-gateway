@@ -14,6 +14,7 @@ hier-kv-gateway-metadata = { workspace = true }
 hier-kv-gateway-routing = { workspace = true }
 hier-kv-gateway-cluster = { workspace = true }
 hier-kv-gateway-connector = { workspace = true }
+hier-kv-gateway-kv-estimate = { workspace = true }
 hier-kv-gateway-api = { path = "../hier-kv-gateway-api" }
 tokio = { workspace = true }
 tracing = { workspace = true }

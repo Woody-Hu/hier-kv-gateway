@@ -50,6 +50,35 @@ kv = 0.35
 load = 0.30
 topology = 0.20
 
+# KV-cache memory estimation & capacity-aware routing.
+#
+# When enabled, the gateway attaches a `KvCapacityStrategy` plugin to the
+# hybrid ensemble. For each request it estimates the KV-cache footprint from
+# the served model's architecture (layers / KV heads / head dim / dtype, MLA
+# latent rank for DeepSeek, sliding window for Mistral/Gemma) and the request
+# shape (prompt tokens + max_tokens, block-padded), using the same analytical
+# formulas as vLLM / SGLang / Mooncake. It then scores each backend by
+# available KV-block / GPU-memory headroom and excludes backends that cannot
+# fit the request — the load-shedding decision.
+#
+# The builtin catalog already knows Llama-2/3, Qwen2/2.5, Mistral, Gemma,
+# DeepSeek-V2/V3/R1, GLM, … Add a `[[kv_estimate.models]]` entry to override
+# a builtin or register a private model (fields map 1:1 to HuggingFace
+# `config.json`).
+[kv_estimate]
+enabled = true
+weight = 0.20
+gpu_mem_safety_fraction = 0.5
+exclude_on_unknown_spec = false
+
+# Example: register a private model spec (uncomment and edit).
+# [[kv_estimate.models]]
+# name = "my-private-model"
+# num_layers = 20
+# num_kv_heads = 4
+# head_dim = 96
+# dtype = "fp16"
+
 [cluster]
 bind_addr = "0.0.0.0:7946"
 seed_peers = []
